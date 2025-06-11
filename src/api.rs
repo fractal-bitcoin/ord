@@ -101,7 +101,7 @@ pub struct Inscription {
   pub height: u32,
   pub id: InscriptionId,
   pub next: Option<InscriptionId>,
-  pub number: i32,
+  pub number: i64,
   pub parents: Vec<InscriptionId>,
   pub previous: Option<InscriptionId>,
   pub rune: Option<SpacedRune>,
@@ -120,7 +120,7 @@ pub struct InscriptionRecursive {
   pub fee: u64,
   pub height: u32,
   pub id: InscriptionId,
-  pub number: i32,
+  pub number: i64,
   pub output: OutPoint,
   pub sat: Option<ordinals::Sat>,
   pub satpoint: SatPoint,
@@ -135,7 +135,7 @@ pub struct ChildInscriptionRecursive {
   pub fee: u64,
   pub height: u32,
   pub id: InscriptionId,
-  pub number: i32,
+  pub number: i64,
   pub output: OutPoint,
   pub sat: Option<ordinals::Sat>,
   pub satpoint: SatPoint,
@@ -146,7 +146,7 @@ pub struct ChildInscriptionRecursive {
 pub struct Inscriptions {
   pub ids: Vec<InscriptionId>,
   pub more: bool,
-  pub page_index: u32,
+  pub page_index: u64,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]

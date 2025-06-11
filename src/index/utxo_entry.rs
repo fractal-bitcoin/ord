@@ -91,8 +91,14 @@ impl UtxoEntry {
 }
 
 impl redb::Value for &UtxoEntry {
-  type SelfType<'a> = &'a UtxoEntry where Self: 'a;
-  type AsBytes<'a> = &'a [u8] where Self: 'a;
+  type SelfType<'a>
+    = &'a UtxoEntry
+  where
+    Self: 'a;
+  type AsBytes<'a>
+    = &'a [u8]
+  where
+    Self: 'a;
 
   fn fixed_width() -> Option<usize> {
     None
@@ -154,18 +160,18 @@ impl<'a> ParsedUtxoEntry<'a> {
     self.inscriptions.unwrap()
   }
 
-  pub fn parse_inscriptions(&self) -> Vec<(u32, u64)> {
+  pub fn parse_inscriptions(&self) -> Vec<(u64, u64)> {
     let inscriptions = self.inscriptions.unwrap();
     let mut byte_offset = 0;
     let mut parsed_inscriptions = Vec::new();
 
     while byte_offset < inscriptions.len() {
-      let sequence_number = u32::from_le_bytes(
-        inscriptions[byte_offset..byte_offset + 4]
+      let sequence_number = u64::from_le_bytes(
+        inscriptions[byte_offset..byte_offset + 8]
           .try_into()
           .unwrap(),
       );
-      byte_offset += 4;
+      byte_offset += 8;
 
       let (satpoint_offset, varint_len) = varint::decode(&inscriptions[byte_offset..]).unwrap();
       let satpoint_offset = u64::try_from(satpoint_offset).unwrap();
@@ -238,7 +244,7 @@ impl UtxoEntryBuf {
     self.advance_state(State::Valid, State::Valid, index);
   }
 
-  pub fn push_inscription(&mut self, sequence_number: u32, satpoint_offset: u64, index: &Index) {
+  pub fn push_inscription(&mut self, sequence_number: u64, satpoint_offset: u64, index: &Index) {
     assert!(index.index_inscriptions);
     self.vec.extend(sequence_number.to_le_bytes());
     varint::encode_to_vec(satpoint_offset.into(), &mut self.vec);

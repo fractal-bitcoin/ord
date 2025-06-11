@@ -407,7 +407,7 @@ impl<'index> Updater<'index> {
     output_sender: &mut mpsc::Sender<OutPoint>,
     utxo_cache: &mut HashMap<OutPoint, UtxoEntryBuf>,
     wtx: &'wtx WriteTransaction,
-    inscription_id_to_sequence_number: &mut Table<'wtx, (u128, u128, u32), u32>,
+    inscription_id_to_sequence_number: &mut Table<'wtx, (u128, u128, u32), u64>,
     statistic_to_count: &mut Table<'wtx, u64, u64>,
     sat_ranges_written: &mut u64,
     outputs_in_block: &mut u64,
