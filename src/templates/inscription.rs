@@ -9,7 +9,7 @@ pub(crate) struct InscriptionHtml {
   pub(crate) height: u32,
   pub(crate) inscription: Inscription,
   pub(crate) id: InscriptionId,
-  pub(crate) number: i32,
+  pub(crate) number: i64,
   pub(crate) next: Option<InscriptionId>,
   pub(crate) output: Option<TxOut>,
   pub(crate) parents: Vec<InscriptionId>,

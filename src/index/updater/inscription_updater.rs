@@ -32,7 +32,7 @@ enum Origin {
     vindicated: bool,
   },
   Old {
-    sequence_number: u32,
+    sequence_number: u64,
     old_satpoint: SatPoint,
   },
 }
@@ -43,17 +43,17 @@ pub(super) struct InscriptionUpdater<'a, 'tx> {
   pub(super) flotsam: Vec<Flotsam>,
   pub(super) height: u32,
   pub(super) home_inscription_count: u64,
-  pub(super) home_inscriptions: &'a mut Table<'tx, u32, InscriptionIdValue>,
-  pub(super) id_to_sequence_number: &'a mut Table<'tx, InscriptionIdValue, u32>,
-  pub(super) inscription_number_to_sequence_number: &'a mut Table<'tx, i32, u32>,
+  pub(super) home_inscriptions: &'a mut Table<'tx, u64, InscriptionIdValue>,
+  pub(super) id_to_sequence_number: &'a mut Table<'tx, InscriptionIdValue, u64>,
+  pub(super) inscription_number_to_sequence_number: &'a mut Table<'tx, i64, u64>,
   pub(super) lost_sats: u64,
-  pub(super) next_sequence_number: u32,
+  pub(super) next_sequence_number: u64,
   pub(super) reward: u64,
   pub(super) transaction_buffer: Vec<u8>,
   pub(super) transaction_id_to_transaction: &'a mut Table<'tx, &'static TxidValue, &'static [u8]>,
-  pub(super) sat_to_sequence_number: &'a mut MultimapTable<'tx, u64, u32>,
-  pub(super) sequence_number_to_children: &'a mut MultimapTable<'tx, u32, u32>,
-  pub(super) sequence_number_to_entry: &'a mut Table<'tx, u32, InscriptionEntryValue>,
+  pub(super) sat_to_sequence_number: &'a mut MultimapTable<'tx, u64, u64>,
+  pub(super) sequence_number_to_children: &'a mut MultimapTable<'tx, u64, u64>,
+  pub(super) sequence_number_to_entry: &'a mut Table<'tx, u64, InscriptionEntryValue>,
   pub(super) timestamp: u32,
   pub(super) unbound_inscriptions: u64,
 }
@@ -415,11 +415,11 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
         vindicated,
       } => {
         let inscription_number = if cursed {
-          let number: i32 = self.cursed_inscription_count.try_into().unwrap();
+          let number: i64 = self.cursed_inscription_count.try_into().unwrap();
           self.cursed_inscription_count += 1;
           -(number + 1)
         } else {
-          let number: i32 = self.blessed_inscription_count.try_into().unwrap();
+          let number: i64 = self.blessed_inscription_count.try_into().unwrap();
           self.blessed_inscription_count += 1;
           number
         };
@@ -486,7 +486,7 @@ impl<'a, 'tx> InscriptionUpdater<'a, 'tx> {
 
             Ok(parent_sequence_number)
           })
-          .collect::<Result<Vec<u32>>>()?;
+          .collect::<Result<Vec<u64>>>()?;
 
         if let Some(ref sender) = index.event_sender {
           sender.blocking_send(Event::InscriptionCreated {

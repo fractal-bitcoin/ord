@@ -52,22 +52,22 @@ pub(crate) mod testing;
 
 const SCHEMA_VERSION: u64 = 28;
 
-define_multimap_table! { SAT_TO_SEQUENCE_NUMBER, u64, u32 }
-define_multimap_table! { SEQUENCE_NUMBER_TO_CHILDREN, u32, u32 }
+define_multimap_table! { SAT_TO_SEQUENCE_NUMBER, u64, u64 }
+define_multimap_table! { SEQUENCE_NUMBER_TO_CHILDREN, u64, u64 }
 define_multimap_table! { SCRIPT_PUBKEY_TO_OUTPOINT, &[u8], OutPointValue }
 define_table! { HEIGHT_TO_BLOCK_HEADER, u32, &HeaderValue }
-define_table! { HEIGHT_TO_LAST_SEQUENCE_NUMBER, u32, u32 }
-define_table! { HOME_INSCRIPTIONS, u32, InscriptionIdValue }
-define_table! { INSCRIPTION_ID_TO_SEQUENCE_NUMBER, InscriptionIdValue, u32 }
-define_table! { INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER, i32, u32 }
+define_table! { HEIGHT_TO_LAST_SEQUENCE_NUMBER, u32, u64 }
+define_table! { HOME_INSCRIPTIONS, u64, InscriptionIdValue }
+define_table! { INSCRIPTION_ID_TO_SEQUENCE_NUMBER, InscriptionIdValue, u64 }
+define_table! { INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER, i64, u64 }
 define_table! { OUTPOINT_TO_RUNE_BALANCES, &OutPointValue, &[u8] }
 define_table! { OUTPOINT_TO_UTXO_ENTRY, &OutPointValue, &UtxoEntry }
 define_table! { RUNE_ID_TO_RUNE_ENTRY, RuneIdValue, RuneEntryValue }
 define_table! { RUNE_TO_RUNE_ID, u128, RuneIdValue }
 define_table! { SAT_TO_SATPOINT, u64, &SatPointValue }
-define_table! { SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY, u32, InscriptionEntryValue }
-define_table! { SEQUENCE_NUMBER_TO_RUNE_ID, u32, RuneIdValue }
-define_table! { SEQUENCE_NUMBER_TO_SATPOINT, u32, &SatPointValue }
+define_table! { SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY, u64, InscriptionEntryValue }
+define_table! { SEQUENCE_NUMBER_TO_RUNE_ID, u64, RuneIdValue }
+define_table! { SEQUENCE_NUMBER_TO_SATPOINT, u64, &SatPointValue }
 define_table! { STATISTIC_TO_COUNT, u64, u64 }
 define_table! { TRANSACTION_ID_TO_RUNE, &TxidValue, u128 }
 define_table! { TRANSACTION_ID_TO_TRANSACTION, &TxidValue, &[u8] }
@@ -350,7 +350,10 @@ impl Index {
           Self::set_statistic(&mut statistics, Statistic::Schema, SCHEMA_VERSION)?;
         }
 
-        if settings.index_runes_raw() && settings.chain() == Chain::Mainnet || settings.chain() == Chain::FractalMainnet || settings.chain() == Chain::FractalTestnet {
+        if settings.index_runes_raw() && settings.chain() == Chain::Mainnet
+          || settings.chain() == Chain::FractalMainnet
+          || settings.chain() == Chain::FractalTestnet
+        {
           let rune = Rune(2055900680524219742);
 
           let id = RuneId { block: 1, tx: 0 };
@@ -375,7 +378,10 @@ impl Index {
                 cap: Some(u128::MAX),
                 height: (
                   Some((Rune::FRACTAL_START_INTERVAL * 4).into()),
-                  Some((Rune::FRACTAL_START_INTERVAL * 4 + Rune::FRACTAL_SUBSIDY_HALVING_INTERVAL).into()),
+                  Some(
+                    (Rune::FRACTAL_START_INTERVAL * 4 + Rune::FRACTAL_SUBSIDY_HALVING_INTERVAL)
+                      .into(),
+                  ),
                 ),
                 offset: (None, None),
               }),
@@ -795,7 +801,7 @@ impl Index {
   }
 
   #[cfg(test)]
-  pub(crate) fn inscription_number(&self, inscription_id: InscriptionId) -> i32 {
+  pub(crate) fn inscription_number(&self, inscription_id: InscriptionId) -> i64 {
     self
       .get_inscription_entry(inscription_id)
       .unwrap()
@@ -1231,7 +1237,7 @@ impl Index {
 
   pub fn get_children_by_sequence_number_paginated(
     &self,
-    sequence_number: u32,
+    sequence_number: u64,
     page_size: usize,
     page_index: usize,
   ) -> Result<(Vec<InscriptionId>, bool)> {
@@ -1266,7 +1272,7 @@ impl Index {
 
   pub fn get_parents_by_sequence_number_paginated(
     &self,
-    parent_sequence_numbers: Vec<u32>,
+    parent_sequence_numbers: Vec<u64>,
     page_index: usize,
   ) -> Result<(Vec<InscriptionId>, bool)> {
     const PAGE_SIZE: usize = 100;
@@ -1410,7 +1416,7 @@ impl Index {
   #[cfg(test)]
   pub(crate) fn get_inscription_id_by_inscription_number(
     &self,
-    inscription_number: i32,
+    inscription_number: i64,
   ) -> Result<Option<InscriptionId>> {
     let rtx = self.database.begin_read()?;
 
@@ -1752,8 +1758,8 @@ impl Index {
 
   pub fn get_inscriptions_paginated(
     &self,
-    page_size: u32,
-    page_index: u32,
+    page_size: u64,
+    page_index: u64,
   ) -> Result<(Vec<InscriptionId>, bool)> {
     let rtx = self.database.begin_read()?;
 
@@ -1777,7 +1783,7 @@ impl Index {
       .map(|result| result.map(|(_number, entry)| InscriptionEntry::load(entry.value()).id))
       .collect::<Result<Vec<InscriptionId>, StorageError>>()?;
 
-    let more = u32::try_from(inscriptions.len()).unwrap_or(u32::MAX) > page_size;
+    let more = u64::try_from(inscriptions.len()).unwrap_or(u64::MAX) > page_size;
 
     if more {
       inscriptions.pop();
@@ -1883,7 +1889,7 @@ impl Index {
     )
   }
 
-  pub fn get_feed_inscriptions(&self, n: usize) -> Result<Vec<(u32, InscriptionId)>> {
+  pub fn get_feed_inscriptions(&self, n: usize) -> Result<Vec<(u64, InscriptionId)>> {
     Ok(
       self
         .database
@@ -2207,7 +2213,7 @@ impl Index {
   fn inscriptions_on_output<'a: 'tx, 'tx>(
     &self,
     outpoint_to_utxo_entry: &'a impl ReadableTable<&'static OutPointValue, &'static UtxoEntry>,
-    sequence_number_to_inscription_entry: &'a impl ReadableTable<u32, InscriptionEntryValue>,
+    sequence_number_to_inscription_entry: &'a impl ReadableTable<u64, InscriptionEntryValue>,
     outpoint: OutPoint,
   ) -> Result<Vec<(SatPoint, InscriptionId)>> {
     if !self.index_inscriptions {

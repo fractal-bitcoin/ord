@@ -294,10 +294,10 @@ pub struct InscriptionEntry {
   pub fee: u64,
   pub height: u32,
   pub id: InscriptionId,
-  pub inscription_number: i32,
-  pub parents: Vec<u32>,
+  pub inscription_number: i64,
+  pub parents: Vec<u64>,
   pub sat: Option<Sat>,
-  pub sequence_number: u32,
+  pub sequence_number: u64,
   pub timestamp: u32,
 }
 
@@ -306,10 +306,10 @@ pub(crate) type InscriptionEntryValue = (
   u64,                // fee
   u32,                // height
   InscriptionIdValue, // inscription id
-  i32,                // inscription number
-  Vec<u32>,           // parents
+  i64,                // inscription number
+  Vec<u64>,           // parents
   Option<u64>,        // sat
-  u32,                // sequence number
+  u64,                // sequence number
   u32,                // timestamp
 );
 
@@ -495,7 +495,7 @@ mod tests {
 
   #[test]
   fn test_sat_range_load_store() {
-    let sat_range = (50 * 100_000_000  as u64, 105_000_000 * 100_000_000 as u64) as SatRange;
+    let sat_range = (50 * 100_000_000 as u64, 105_000_000 * 100_000_000 as u64) as SatRange;
     let stored_bytes = sat_range.store();
     let loaded_sat_range = SatRange::load(stored_bytes);
     assert_eq!(sat_range, loaded_sat_range);
