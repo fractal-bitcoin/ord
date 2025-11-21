@@ -1822,25 +1822,32 @@ impl Index {
   }
 
   pub fn inscription_count(&self, txid: Txid) -> Result<u32> {
-    // let start = InscriptionId { index: 0, txid };
-    // let end = InscriptionId {
-    //   index: u32::MAX,
-    //   txid,
-    // };
-
     let cf = self
       .database
       .cf_handle(CF_INSCRIPTION_ID_TO_SEQUENCE_NUMBER)
       .unwrap();
+
+    // 从该 txid 的最小 InscriptionId 开始迭代
+    // 由于 CBOR 序列化格式，相同 txid 的 InscriptionId 在字典序上可能不连续
+    // 但我们可以从最小的开始，遇到不同的 txid 时停止
+    let start = InscriptionId { txid, index: 0 };
+    let start_key = start.store();
     let mut count = 0;
-    let iter = self.database.iterator_cf(cf, IteratorMode::Start);
+
+    // 使用 IteratorMode::From 从指定位置开始迭代
+    let iter = self
+      .database
+      .iterator_cf(cf, IteratorMode::From(&start_key, Direction::Forward));
 
     for result in iter {
       let (inscription_id_bytes, _) = result?;
       let inscription_id = InscriptionId::load(inscription_id_bytes.to_vec());
-      if inscription_id.txid == txid {
-        count += 1;
+
+      if inscription_id.txid != txid {
+        break;
       }
+
+      count += 1;
     }
 
     Ok(count)
