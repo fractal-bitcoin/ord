@@ -29,6 +29,8 @@ simple_tcp = []
 simple_uds = []
 # Enable Socks5 Proxy in transport
 proxy = ["socks"]
+# Compatibility feature for base64
+base64-compat = []
 
 
 [dependencies]

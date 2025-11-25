@@ -25,6 +25,7 @@ fn git_commit() -> Option<String> {
 }
 
 fn main() {
+  println!("cargo:rustc-check-cfg=cfg(fuzzing)");
   println!(
     "cargo:rustc-env=GIT_BRANCH={}",
     git_branch().unwrap_or_default()

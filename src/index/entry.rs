@@ -8,6 +8,7 @@ pub(crate) trait Entry: Sized {
   fn store(self) -> Self::Value;
 
   // Helper method to load from bytes for fixed-size array types
+  #[allow(dead_code)]
   fn load_from_fixed_bytes<const N: usize>(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>>
   where
     Self::Value: From<[u8; N]>,
@@ -240,6 +241,7 @@ impl Entry for InscriptionEntry {
   }
 }
 
+#[allow(dead_code)]
 pub(crate) type InscriptionIdValue = Vec<u8>;
 
 impl Entry for InscriptionId {

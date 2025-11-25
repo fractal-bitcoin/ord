@@ -1,15 +1,18 @@
 use super::*;
 use rocksdb::{ColumnFamily, IteratorMode};
 
+#[allow(dead_code)]
 pub(crate) struct Rtx {
   database: rocksdb::DB,
 }
 
 impl Rtx {
+  #[allow(dead_code)]
   pub(crate) fn new(database: rocksdb::DB) -> Result<Rtx> {
     Ok(Self { database })
   }
 
+  #[allow(dead_code)]
   pub(crate) fn block_height(&self) -> Result<Option<Height>> {
     let height_to_block_header_cf = self
       .database
@@ -26,6 +29,7 @@ impl Rtx {
     }
   }
 
+  #[allow(dead_code)]
   pub(crate) fn block_count(&self) -> Result<u32> {
     let height_to_block_header_cf = self
       .database
@@ -42,6 +46,7 @@ impl Rtx {
     }
   }
 
+  #[allow(dead_code)]
   pub(crate) fn block_hash(&self, height: Option<u32>) -> Result<Option<BlockHash>> {
     let height_to_block_header_cf = self
       .database
@@ -77,6 +82,7 @@ impl Rtx {
   }
 
   /// Get a column family handle by name
+  #[allow(dead_code)]
   pub(crate) fn get_cf(&self, name: &str) -> Result<&ColumnFamily> {
     self
       .database
@@ -85,6 +91,7 @@ impl Rtx {
   }
 
   /// Get a value from a specific column family
+  #[allow(dead_code)]
   pub(crate) fn get_cf_value<K>(&self, cf: &ColumnFamily, key: &K) -> Result<Option<Vec<u8>>>
   where
     K: AsRef<[u8]>,
@@ -93,6 +100,7 @@ impl Rtx {
   }
 
   /// Iterate over a column family
+  #[allow(dead_code)]
   pub(crate) fn iter_cf(&self, cf: &ColumnFamily, mode: IteratorMode) -> rocksdb::DBIterator {
     self.database.iterator_cf(cf, mode)
   }
