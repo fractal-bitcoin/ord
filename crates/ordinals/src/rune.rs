@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(
-  Default, Debug, PartialEq, Copy, Clone, PartialOrd, Ord, Eq, DeserializeFromStr, SerializeDisplay,
+  Default, Debug, PartialEq, Copy, Clone, PartialOrd, Ord, Eq, Hash, DeserializeFromStr, SerializeDisplay,
 )]
 pub struct Rune(pub u128);
 

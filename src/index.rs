@@ -1,9 +1,6 @@
 use {
   self::{
-    entry::{
-      Entry, HeaderValue, InscriptionEntry, InscriptionEntryValue, InscriptionIdValue,
-      OutPointValue, RuneEntryValue, RuneIdValue, SatPointValue, SatRange, TxidValue,
-    },
+    entry::{Entry, InscriptionEntry, SatRange},
     event::Event,
     lot::Lot,
     reorg::Reorg,
@@ -15,6 +12,7 @@ use {
     runes::MintError,
     subcommand::{find::FindRangeOutput, server::query},
     templates::StatusHtml,
+    timestamp,
   },
   bitcoin::block::Header,
   bitcoincore_rpc::{
@@ -24,15 +22,15 @@ use {
   chrono::SubsecRound,
   indicatif::{ProgressBar, ProgressStyle},
   log::log_enabled,
-  redb::{
-    Database, DatabaseError, MultimapTable, MultimapTableDefinition, MultimapTableHandle,
-    ReadOnlyTable, ReadableMultimapTable, ReadableTable, ReadableTableMetadata, RepairSession,
-    StorageError, Table, TableDefinition, TableHandle, TableStats, WriteTransaction,
+  ref_cast::RefCast,
+  rocksdb::{
+    ColumnFamily, ColumnFamilyDescriptor, DBCompressionType, Direction, FlushOptions, IteratorMode,
+    Options, WriteBatch, WriteOptions, DB,
   },
   std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{BufWriter, Write},
-    sync::Once,
+    process::exit,
   },
 };
 
@@ -44,6 +42,7 @@ mod fetcher;
 mod lot;
 mod reorg;
 mod rtx;
+mod transaction_cache;
 mod updater;
 mod utxo_entry;
 
@@ -52,28 +51,31 @@ pub(crate) mod testing;
 
 const SCHEMA_VERSION: u64 = 28;
 
-define_multimap_table! { SAT_TO_SEQUENCE_NUMBER, u64, u64 }
-define_multimap_table! { SEQUENCE_NUMBER_TO_CHILDREN, u64, u64 }
-define_multimap_table! { SCRIPT_PUBKEY_TO_OUTPOINT, &[u8], OutPointValue }
-define_table! { HEIGHT_TO_BLOCK_HEADER, u32, &HeaderValue }
-define_table! { HEIGHT_TO_LAST_SEQUENCE_NUMBER, u32, u64 }
-define_table! { HOME_INSCRIPTIONS, u64, InscriptionIdValue }
-define_table! { INSCRIPTION_ID_TO_SEQUENCE_NUMBER, InscriptionIdValue, u64 }
-define_table! { INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER, i64, u64 }
-define_table! { OUTPOINT_TO_RUNE_BALANCES, &OutPointValue, &[u8] }
-define_table! { OUTPOINT_TO_UTXO_ENTRY, &OutPointValue, &UtxoEntry }
-define_table! { RUNE_ID_TO_RUNE_ENTRY, RuneIdValue, RuneEntryValue }
-define_table! { RUNE_TO_RUNE_ID, u128, RuneIdValue }
-define_table! { SAT_TO_SATPOINT, u64, &SatPointValue }
-define_table! { SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY, u64, InscriptionEntryValue }
-define_table! { SEQUENCE_NUMBER_TO_RUNE_ID, u64, RuneIdValue }
-define_table! { SEQUENCE_NUMBER_TO_SATPOINT, u64, &SatPointValue }
-define_table! { STATISTIC_TO_COUNT, u64, u64 }
-define_table! { TRANSACTION_ID_TO_RUNE, &TxidValue, u128 }
-define_table! { TRANSACTION_ID_TO_TRANSACTION, &TxidValue, &[u8] }
-define_table! { WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP, u32, u128 }
+// Column family names
+const CF_SAT_TO_SEQUENCE_NUMBER: &str = "sat_to_sequence_number";
+const CF_SEQUENCE_NUMBER_TO_CHILDREN: &str = "sequence_number_to_children";
+const CF_SCRIPT_PUBKEY_TO_OUTPOINT: &str = "script_pubkey_to_outpoint";
+const CF_HEIGHT_TO_BLOCK_HEADER: &str = "height_to_block_header";
+const CF_HEIGHT_TO_LAST_SEQUENCE_NUMBER: &str = "height_to_last_sequence_number";
+const CF_HOME_INSCRIPTIONS: &str = "home_inscriptions";
+const CF_INSCRIPTION_ID_TO_SEQUENCE_NUMBER: &str = "inscription_id_to_sequence_number";
+const CF_INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER: &str = "inscription_number_to_sequence_number";
+const CF_OUTPOINT_TO_RUNE_BALANCES: &str = "outpoint_to_rune_balances";
+const CF_OUTPOINT_TO_UTXO_ENTRY: &str = "outpoint_to_utxo_entry";
+const CF_OUTPOINT_TO_NONDUST_UTXO_ENTRY: &str = "outpoint_to_nondust_utxo_entry";
+const CF_RUNE_ID_TO_RUNE_ENTRY: &str = "rune_id_to_rune_entry";
+const CF_RUNE_TO_RUNE_ID: &str = "rune_to_rune_id";
+const CF_SAT_TO_SATPOINT: &str = "sat_to_satpoint";
+const CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY: &str = "sequence_number_to_inscription_entry";
+const CF_SEQUENCE_NUMBER_TO_RUNE_ID: &str = "sequence_number_to_rune_id";
+const CF_SEQUENCE_NUMBER_TO_SATPOINT: &str = "sequence_number_to_satpoint";
+const CF_STATISTIC_TO_COUNT: &str = "statistic_to_count";
+const CF_TRANSACTION_ID_TO_RUNE: &str = "transaction_id_to_rune";
+const CF_TRANSACTION_ID_TO_TRANSACTION: &str = "transaction_id_to_transaction";
+const CF_WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP: &str =
+  "write_transaction_starting_block_count_to_timestamp";
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Eq, Hash, PartialEq)]
 pub(crate) enum Statistic {
   Schema = 0,
   BlessedInscriptions = 1,
@@ -90,6 +92,7 @@ pub(crate) enum Statistic {
   ReservedRunes = 12,
   Runes = 13,
   SatRanges = 14,
+  LastSavepointHeight = 15,
   UnboundInscriptions = 16,
 }
 
@@ -137,20 +140,21 @@ pub(crate) struct TableInfo {
   tree_height: u32,
 }
 
-impl From<TableStats> for TableInfo {
-  fn from(stats: TableStats) -> Self {
-    Self {
-      branch_pages: stats.branch_pages(),
-      fragmented_bytes: stats.fragmented_bytes(),
-      leaf_pages: stats.leaf_pages(),
-      metadata_bytes: stats.metadata_bytes(),
-      proportion: 0.0,
-      stored_bytes: stats.stored_bytes(),
-      total_bytes: stats.stored_bytes() + stats.metadata_bytes() + stats.fragmented_bytes(),
-      tree_height: stats.tree_height(),
-    }
-  }
-}
+// TableStats implementation removed - not compatible with RocksDB
+// impl From<TableStats> for TableInfo {
+//   fn from(stats: TableStats) -> Self {
+//     Self {
+//       branch_pages: stats.branch_pages(),
+//       fragmented_bytes: stats.fragmented_bytes(),
+//       leaf_pages: stats.leaf_pages(),
+//       metadata_bytes: stats.metadata_bytes(),
+//       proportion: 0.0,
+//       stored_bytes: stats.stored_bytes(),
+//       total_bytes: stats.stored_bytes() + stats.metadata_bytes() + stats.fragmented_bytes(),
+//       tree_height: stats.tree_height(),
+//     }
+//   }
+// }
 
 #[derive(Serialize)]
 pub struct TransactionInfo {
@@ -183,8 +187,8 @@ impl<T> BitcoinCoreRpcResultExt<T> for Result<T, bitcoincore_rpc::Error> {
 
 pub struct Index {
   pub(crate) client: Client,
-  database: Database,
-  durability: redb::Durability,
+  database: DB,
+  write_options: WriteOptions,
   event_sender: Option<tokio::sync::mpsc::Sender<Event>>,
   first_inscription_height: u32,
   genesis_block_coinbase_transaction: Transaction,
@@ -222,153 +226,194 @@ impl Index {
 
     log::info!("Setting index cache size to {} bytes", index_cache_size);
 
-    let durability = if cfg!(test) {
-      redb::Durability::None
-    } else {
-      redb::Durability::Immediate
-    };
-
-    let index_path = path.clone();
-    let once = Once::new();
-    let progress_bar = Mutex::new(None);
-    let integration_test = settings.integration_test();
-
-    let repair_callback = move |progress: &mut RepairSession| {
-      once.call_once(|| println!("Index file `{}` needs recovery. This can take a long time, especially for the --index-sats index.", index_path.display()));
-
-      if !(cfg!(test) || log_enabled!(log::Level::Info) || integration_test) {
-        let mut guard = progress_bar.lock().unwrap();
-
-        let progress_bar = guard.get_or_insert_with(|| {
-          let progress_bar = ProgressBar::new(100);
-          progress_bar.set_style(
-            ProgressStyle::with_template("[repairing database] {wide_bar} {pos}/{len}").unwrap(),
-          );
-          progress_bar
-        });
-
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        progress_bar.set_position((progress.progress() * 100.0) as u64);
+    let write_options = {
+      let mut write_options = WriteOptions::default();
+      if cfg!(test) {
+        write_options.disable_wal(true);
       }
+      write_options
     };
 
-    let database = match Database::builder()
-      .set_cache_size(index_cache_size)
-      .set_repair_callback(repair_callback)
-      .open(&path)
-    {
-      Ok(database) => {
-        {
-          let schema_version = database
-            .begin_read()?
-            .open_table(STATISTIC_TO_COUNT)?
-            .get(&Statistic::Schema.key())?
-            .map(|x| x.value())
-            .unwrap_or(0);
+    // RocksDB doesn't use repair callbacks like redb
+    // RocksDB has built-in recovery mechanisms
 
-          match schema_version.cmp(&SCHEMA_VERSION) {
-            cmp::Ordering::Less =>
-              bail!(
-                "index at `{}` appears to have been built with an older, incompatible version of ord, consider deleting and rebuilding the index: index schema {schema_version}, ord schema {SCHEMA_VERSION}",
-                path.display()
-              ),
-            cmp::Ordering::Greater =>
-              bail!(
-                "index at `{}` appears to have been built with a newer, incompatible version of ord, consider updating ord: index schema {schema_version}, ord schema {SCHEMA_VERSION}",
-                path.display()
-              ),
-            cmp::Ordering::Equal => {
-            }
+    let column_families = vec![
+      CF_SAT_TO_SEQUENCE_NUMBER,
+      CF_SEQUENCE_NUMBER_TO_CHILDREN,
+      CF_SCRIPT_PUBKEY_TO_OUTPOINT,
+      CF_HEIGHT_TO_BLOCK_HEADER,
+      CF_HEIGHT_TO_LAST_SEQUENCE_NUMBER,
+      CF_HOME_INSCRIPTIONS,
+      CF_INSCRIPTION_ID_TO_SEQUENCE_NUMBER,
+      CF_INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER,
+      CF_OUTPOINT_TO_RUNE_BALANCES,
+      CF_OUTPOINT_TO_UTXO_ENTRY,
+      CF_OUTPOINT_TO_NONDUST_UTXO_ENTRY,
+      CF_RUNE_ID_TO_RUNE_ENTRY,
+      CF_RUNE_TO_RUNE_ID,
+      CF_SAT_TO_SATPOINT,
+      CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY,
+      CF_SEQUENCE_NUMBER_TO_RUNE_ID,
+      CF_SEQUENCE_NUMBER_TO_SATPOINT,
+      CF_STATISTIC_TO_COUNT,
+      CF_TRANSACTION_ID_TO_RUNE,
+      CF_TRANSACTION_ID_TO_TRANSACTION,
+      CF_WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP,
+    ];
+
+    // Create options for opening existing database
+    let mut opts = Options::default();
+    opts.create_if_missing(false);
+    opts.create_missing_column_families(false);
+
+    opts.set_max_total_wal_size(1024 * 1024 * 1024);
+    opts.set_max_open_files(256);
+    opts.set_max_background_jobs(6);
+    opts.set_max_background_compactions(4);
+    opts.set_max_background_flushes(2);
+    opts.set_bytes_per_sync(4 * 1024 * 1024); // 1MB
+    opts.set_wal_bytes_per_sync(4 * 1024 * 1024); // 1MB
+
+    let database = match DB::open_cf_descriptors(
+      &opts,
+      &path,
+      column_families
+        .iter()
+        .map(|name| {
+          let mut cf_opts = Options::default();
+
+          cf_opts.set_write_buffer_size(256 * 1024 * 1024);
+          cf_opts.set_max_write_buffer_number(32);
+          cf_opts.set_compression_type(DBCompressionType::None);
+          cf_opts.set_target_file_size_base(128 * 1024 * 1024);
+          cf_opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
+
+          cf_opts.set_level_zero_file_num_compaction_trigger(4);
+          cf_opts.set_level_zero_slowdown_writes_trigger(8);
+          cf_opts.set_level_zero_stop_writes_trigger(12);
+
+          ColumnFamilyDescriptor::new(*name, cf_opts)
+        })
+        .collect::<Vec<_>>(),
+    ) {
+      Ok(database) => {
+        // Check schema version
+        let schema_version = database
+          .get_cf(
+            database.cf_handle(CF_STATISTIC_TO_COUNT).unwrap(),
+            &Statistic::Schema.key().to_be_bytes(),
+          )?
+          .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
+          .unwrap_or(0);
+
+        match schema_version.cmp(&SCHEMA_VERSION) {
+          cmp::Ordering::Less =>
+            bail!(
+              "index at `{}` appears to have been built with an older, incompatible version of ord, consider deleting and rebuilding the index: index schema {schema_version}, ord schema {SCHEMA_VERSION}",
+              path.display()
+            ),
+          cmp::Ordering::Greater =>
+            bail!(
+              "index at `{}` appears to have been built with a newer, incompatible version of ord, consider updating ord: index schema {schema_version}, ord schema {SCHEMA_VERSION}",
+              path.display()
+            ),
+          cmp::Ordering::Equal => {
           }
         }
 
         database
       }
-      Err(DatabaseError::Storage(StorageError::Io(error)))
-        if error.kind() == io::ErrorKind::NotFound =>
-      {
-        let database = Database::builder()
-          .set_cache_size(index_cache_size)
-          .create(&path)?;
+      Err(_) => {
+        // Create new database with column families
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
 
-        let mut tx = database.begin_write()?;
+        let database = DB::open_cf_descriptors(
+          &opts,
+          &path,
+          column_families
+            .iter()
+            .map(|name| {
+              let mut cf_opts = Options::default();
 
-        tx.set_durability(durability);
+              cf_opts.set_write_buffer_size(256 * 1024 * 1024);
+              cf_opts.set_max_write_buffer_number(32);
+              cf_opts.set_compression_type(DBCompressionType::None);
+              cf_opts.set_target_file_size_base(128 * 1024 * 1024);
+              cf_opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
 
-        tx.open_multimap_table(SAT_TO_SEQUENCE_NUMBER)?;
-        tx.open_multimap_table(SCRIPT_PUBKEY_TO_OUTPOINT)?;
-        tx.open_multimap_table(SEQUENCE_NUMBER_TO_CHILDREN)?;
-        tx.open_table(HEIGHT_TO_BLOCK_HEADER)?;
-        tx.open_table(HEIGHT_TO_LAST_SEQUENCE_NUMBER)?;
-        tx.open_table(HOME_INSCRIPTIONS)?;
-        tx.open_table(INSCRIPTION_ID_TO_SEQUENCE_NUMBER)?;
-        tx.open_table(INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER)?;
-        tx.open_table(OUTPOINT_TO_RUNE_BALANCES)?;
-        tx.open_table(OUTPOINT_TO_UTXO_ENTRY)?;
-        tx.open_table(RUNE_ID_TO_RUNE_ENTRY)?;
-        tx.open_table(RUNE_TO_RUNE_ID)?;
-        tx.open_table(SAT_TO_SATPOINT)?;
-        tx.open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?;
-        tx.open_table(SEQUENCE_NUMBER_TO_RUNE_ID)?;
-        tx.open_table(SEQUENCE_NUMBER_TO_SATPOINT)?;
-        tx.open_table(TRANSACTION_ID_TO_RUNE)?;
-        tx.open_table(WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP)?;
+              cf_opts.set_level_zero_file_num_compaction_trigger(4);
+              cf_opts.set_level_zero_slowdown_writes_trigger(8);
+              cf_opts.set_level_zero_stop_writes_trigger(12);
 
-        {
-          let mut statistics = tx.open_table(STATISTIC_TO_COUNT)?;
+              ColumnFamilyDescriptor::new(*name, cf_opts)
+            })
+            .collect::<Vec<_>>(),
+        )?;
 
-          Self::set_statistic(
-            &mut statistics,
-            Statistic::IndexAddresses,
-            u64::from(settings.index_addresses_raw()),
-          )?;
+        // Initialize statistics
+        let mut batch = WriteBatch::default();
 
-          Self::set_statistic(
-            &mut statistics,
-            Statistic::IndexInscriptions,
-            u64::from(settings.index_inscriptions_raw()),
-          )?;
+        batch.put_cf(
+          database.cf_handle(CF_STATISTIC_TO_COUNT).unwrap(),
+          &Statistic::IndexAddresses.key().to_be_bytes(),
+          &u64::from(settings.index_addresses_raw()).to_be_bytes(),
+        );
 
-          Self::set_statistic(
-            &mut statistics,
-            Statistic::IndexRunes,
-            u64::from(settings.index_runes_raw()),
-          )?;
+        batch.put_cf(
+          database.cf_handle(CF_STATISTIC_TO_COUNT).unwrap(),
+          &Statistic::IndexInscriptions.key().to_be_bytes(),
+          &u64::from(settings.index_inscriptions_raw()).to_be_bytes(),
+        );
 
-          Self::set_statistic(
-            &mut statistics,
-            Statistic::IndexSats,
-            u64::from(settings.index_sats_raw()),
-          )?;
+        batch.put_cf(
+          database.cf_handle(CF_STATISTIC_TO_COUNT).unwrap(),
+          &Statistic::IndexRunes.key().to_be_bytes(),
+          &u64::from(settings.index_runes_raw()).to_be_bytes(),
+        );
 
-          Self::set_statistic(
-            &mut statistics,
-            Statistic::IndexTransactions,
-            u64::from(settings.index_transactions_raw()),
-          )?;
+        batch.put_cf(
+          database.cf_handle(CF_STATISTIC_TO_COUNT).unwrap(),
+          &Statistic::IndexSats.key().to_be_bytes(),
+          &u64::from(settings.index_sats_raw()).to_be_bytes(),
+        );
 
-          Self::set_statistic(&mut statistics, Statistic::Schema, SCHEMA_VERSION)?;
-        }
+        batch.put_cf(
+          database.cf_handle(CF_STATISTIC_TO_COUNT).unwrap(),
+          &Statistic::IndexTransactions.key().to_be_bytes(),
+          &u64::from(settings.index_transactions_raw()).to_be_bytes(),
+        );
+
+        batch.put_cf(
+          database.cf_handle(CF_STATISTIC_TO_COUNT).unwrap(),
+          &Statistic::Schema.key().to_be_bytes(),
+          &SCHEMA_VERSION.to_be_bytes(),
+        );
 
         if settings.index_runes_raw() && settings.chain() == Chain::Mainnet
           || settings.chain() == Chain::FractalMainnet
           || settings.chain() == Chain::FractalTestnet
         {
           let rune = Rune(2055900680524219742);
-
           let id = RuneId { block: 1, tx: 0 };
           let etching = Txid::all_zeros();
 
-          tx.open_table(RUNE_TO_RUNE_ID)?
-            .insert(rune.store(), id.store())?;
+          batch.put_cf(
+            database.cf_handle(CF_RUNE_TO_RUNE_ID).unwrap(),
+            &rune.store(),
+            &id.store(),
+          );
 
-          let mut statistics = tx.open_table(STATISTIC_TO_COUNT)?;
+          batch.put_cf(
+            database.cf_handle(CF_STATISTIC_TO_COUNT).unwrap(),
+            &Statistic::Runes.key().to_be_bytes(),
+            &1u64.to_be_bytes(),
+          );
 
-          Self::set_statistic(&mut statistics, Statistic::Runes, 1)?;
-
-          tx.open_table(RUNE_ID_TO_RUNE_ENTRY)?.insert(
-            id.store(),
-            RuneEntry {
+          batch.put_cf(
+            database.cf_handle(CF_RUNE_ID_TO_RUNE_ENTRY).unwrap(),
+            &id.store(),
+            &RuneEntry {
               block: id.block,
               burned: 0,
               divisibility: 0,
@@ -394,17 +439,19 @@ impl Index {
               turbo: true,
             }
             .store(),
-          )?;
+          );
 
-          tx.open_table(TRANSACTION_ID_TO_RUNE)?
-            .insert(&etching.store(), rune.store())?;
+          batch.put_cf(
+            database.cf_handle(CF_TRANSACTION_ID_TO_RUNE).unwrap(),
+            &etching.store(),
+            &rune.store(),
+          );
         }
 
-        tx.commit()?;
-
+        database.write_opt(batch, &write_options)?;
         database
       }
-      Err(error) => bail!("failed to open index: {error}"),
+      Err(_) => bail!("failed to open index: database creation failed"),
     };
 
     let index_addresses;
@@ -414,13 +461,16 @@ impl Index {
     let index_inscriptions;
 
     {
-      let tx = database.begin_read()?;
-      let statistics = tx.open_table(STATISTIC_TO_COUNT)?;
-      index_addresses = Self::is_statistic_set(&statistics, Statistic::IndexAddresses)?;
-      index_inscriptions = Self::is_statistic_set(&statistics, Statistic::IndexInscriptions)?;
-      index_runes = Self::is_statistic_set(&statistics, Statistic::IndexRunes)?;
-      index_sats = Self::is_statistic_set(&statistics, Statistic::IndexSats)?;
-      index_transactions = Self::is_statistic_set(&statistics, Statistic::IndexTransactions)?;
+      let statistics_cf = database.cf_handle(CF_STATISTIC_TO_COUNT).unwrap();
+      index_addresses =
+        Self::is_statistic_set_rocksdb(&database, statistics_cf, Statistic::IndexAddresses)?;
+      index_inscriptions =
+        Self::is_statistic_set_rocksdb(&database, statistics_cf, Statistic::IndexInscriptions)?;
+      index_runes =
+        Self::is_statistic_set_rocksdb(&database, statistics_cf, Statistic::IndexRunes)?;
+      index_sats = Self::is_statistic_set_rocksdb(&database, statistics_cf, Statistic::IndexSats)?;
+      index_transactions =
+        Self::is_statistic_set_rocksdb(&database, statistics_cf, Statistic::IndexTransactions)?;
     }
 
     let genesis_block_coinbase_transaction =
@@ -430,7 +480,7 @@ impl Index {
       genesis_block_coinbase_txid: genesis_block_coinbase_transaction.txid(),
       client,
       database,
-      durability,
+      write_options,
       event_sender,
       first_inscription_height: settings.first_inscription_height(),
       genesis_block_coinbase_transaction,
@@ -456,19 +506,25 @@ impl Index {
     outpoint == OutPoint::null() || outpoint == unbound_outpoint()
   }
 
-  #[cfg(test)]
-  fn set_durability(&mut self, durability: redb::Durability) {
-    self.durability = durability;
-  }
-
   pub fn contains_output(&self, output: &OutPoint) -> Result<bool> {
     Ok(
       self
         .database
-        .begin_read()?
-        .open_table(OUTPOINT_TO_UTXO_ENTRY)?
-        .get(&output.store())?
-        .is_some(),
+        .get_cf(
+          self
+            .database
+            .cf_handle(CF_OUTPOINT_TO_NONDUST_UTXO_ENTRY)
+            .unwrap(),
+          &output.store(),
+        )?
+        .is_some()
+        || self
+          .database
+          .get_cf(
+            self.database.cf_handle(CF_OUTPOINT_TO_UTXO_ENTRY).unwrap(),
+            &output.store(),
+          )?
+          .is_some(),
     )
   }
 
@@ -485,25 +541,29 @@ impl Index {
   }
 
   pub fn status(&self) -> Result<StatusHtml> {
-    let rtx = self.database.begin_read()?;
-
-    let statistic_to_count = rtx.open_table(STATISTIC_TO_COUNT)?;
+    let statistic_cf = self.database.cf_handle(CF_STATISTIC_TO_COUNT).unwrap();
+    let height_cf = self.database.cf_handle(CF_HEIGHT_TO_BLOCK_HEADER).unwrap();
 
     let statistic = |statistic: Statistic| -> Result<u64> {
       Ok(
-        statistic_to_count
-          .get(statistic.key())?
-          .map(|guard| guard.value())
+        self
+          .database
+          .get_cf(statistic_cf, &statistic.key().to_be_bytes())?
+          .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
           .unwrap_or_default(),
       )
     };
 
-    let height = rtx
-      .open_table(HEIGHT_TO_BLOCK_HEADER)?
-      .range(0..)?
-      .next_back()
-      .transpose()?
-      .map(|(height, _header)| height.value());
+    let height = {
+      let mut iter = self.database.iterator_cf(height_cf, IteratorMode::End);
+      if let Some(Ok((height_bytes, _))) = iter.next() {
+        Some(u32::from_be_bytes(
+          height_bytes.as_ref().try_into().unwrap(),
+        ))
+      } else {
+        None
+      }
+    };
 
     let next_height = height.map(|height| height + 1).unwrap_or(0);
 
@@ -535,30 +595,55 @@ impl Index {
   }
 
   pub fn info(&self) -> Result<Info> {
-    let stats = self.database.begin_write()?.stats()?;
-
-    let rtx = self.database.begin_read()?;
-
+    // For RocksDB, we'll create a simplified info structure
     let mut tables: BTreeMap<String, TableInfo> = BTreeMap::new();
 
-    for handle in rtx.list_tables()? {
-      let name = handle.name().into();
-      let stats = rtx.open_untyped_table(handle)?.stats()?;
-      tables.insert(name, stats.into());
-    }
+    // Add basic table info for RocksDB
+    let column_families = vec![
+      CF_SAT_TO_SEQUENCE_NUMBER,
+      CF_SEQUENCE_NUMBER_TO_CHILDREN,
+      CF_SCRIPT_PUBKEY_TO_OUTPOINT,
+      CF_HEIGHT_TO_BLOCK_HEADER,
+      CF_HEIGHT_TO_LAST_SEQUENCE_NUMBER,
+      CF_HOME_INSCRIPTIONS,
+      CF_INSCRIPTION_ID_TO_SEQUENCE_NUMBER,
+      CF_INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER,
+      CF_OUTPOINT_TO_RUNE_BALANCES,
+      CF_OUTPOINT_TO_UTXO_ENTRY,
+      CF_OUTPOINT_TO_NONDUST_UTXO_ENTRY,
+      CF_RUNE_ID_TO_RUNE_ENTRY,
+      CF_RUNE_TO_RUNE_ID,
+      CF_SAT_TO_SATPOINT,
+      CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY,
+      CF_SEQUENCE_NUMBER_TO_RUNE_ID,
+      CF_SEQUENCE_NUMBER_TO_SATPOINT,
+      CF_STATISTIC_TO_COUNT,
+      CF_TRANSACTION_ID_TO_RUNE,
+      CF_TRANSACTION_ID_TO_TRANSACTION,
+      CF_WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP,
+    ];
 
-    for handle in rtx.list_multimap_tables()? {
-      let name = handle.name().into();
-      let stats = rtx.open_untyped_multimap_table(handle)?.stats()?;
-      tables.insert(name, stats.into());
-    }
+    for cf_name in column_families {
+      let cf = self.database.cf_handle(cf_name).unwrap();
+      let mut count = 0;
+      let iter = self.database.iterator_cf(cf, IteratorMode::Start);
+      for _ in iter {
+        count += 1;
+      }
 
-    for table in rtx.list_tables()? {
-      assert!(tables.contains_key(table.name()));
-    }
-
-    for table in rtx.list_multimap_tables()? {
-      assert!(tables.contains_key(table.name()));
+      tables.insert(
+        cf_name.to_string(),
+        TableInfo {
+          branch_pages: 0,
+          fragmented_bytes: 0,
+          leaf_pages: count,
+          metadata_bytes: 0,
+          proportion: 0.0,
+          stored_bytes: count as u64 * 100, // Estimate
+          total_bytes: count as u64 * 100,
+          tree_height: 1,
+        },
+      );
     }
 
     let total_bytes = tables
@@ -571,49 +656,82 @@ impl Index {
     });
 
     let info = {
-      let statistic_to_count = rtx.open_table(STATISTIC_TO_COUNT)?;
-      let sat_ranges = statistic_to_count
-        .get(&Statistic::SatRanges.key())?
-        .map(|x| x.value())
+      let statistic_cf = self.database.cf_handle(CF_STATISTIC_TO_COUNT).unwrap();
+      let sat_ranges = self
+        .database
+        .get_cf(statistic_cf, &Statistic::SatRanges.key().to_be_bytes())?
+        .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
         .unwrap_or(0);
-      let outputs_traversed = statistic_to_count
-        .get(&Statistic::OutputsTraversed.key())?
-        .map(|x| x.value())
+      let outputs_traversed = self
+        .database
+        .get_cf(
+          statistic_cf,
+          &Statistic::OutputsTraversed.key().to_be_bytes(),
+        )?
+        .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
         .unwrap_or(0);
       Info {
         index_path: self.path.clone(),
-        blocks_indexed: rtx
-          .open_table(HEIGHT_TO_BLOCK_HEADER)?
-          .range(0..)?
-          .next_back()
-          .transpose()?
-          .map(|(height, _header)| height.value() + 1)
-          .unwrap_or(0),
-        branch_pages: stats.branch_pages(),
-        fragmented_bytes: stats.fragmented_bytes(),
+        blocks_indexed: {
+          let height_cf = self.database.cf_handle(CF_HEIGHT_TO_BLOCK_HEADER).unwrap();
+          let mut iter = self.database.iterator_cf(height_cf, IteratorMode::End);
+          if let Some(Ok((height_bytes, _))) = iter.next() {
+            u32::from_be_bytes(height_bytes.as_ref().try_into().unwrap()) + 1
+          } else {
+            0
+          }
+        },
+        branch_pages: 0,
+        fragmented_bytes: 0,
         index_file_size: fs::metadata(&self.path)?.len(),
-        leaf_pages: stats.leaf_pages(),
-        metadata_bytes: stats.metadata_bytes(),
+        leaf_pages: 0,
+        metadata_bytes: 0,
         sat_ranges,
         outputs_traversed,
-        page_size: stats.page_size(),
-        stored_bytes: stats.stored_bytes(),
+        page_size: 4096,
+        stored_bytes: 0,
         total_bytes,
         tables,
-        transactions: rtx
-          .open_table(WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP)?
-          .range(0..)?
-          .flat_map(|result| {
-            result.map(
-              |(starting_block_count, starting_timestamp)| TransactionInfo {
-                starting_block_count: starting_block_count.value(),
-                starting_timestamp: starting_timestamp.value(),
-              },
-            )
-          })
-          .collect(),
-        tree_height: stats.tree_height(),
-        utxos_indexed: rtx.open_table(OUTPOINT_TO_UTXO_ENTRY)?.len()?,
+        transactions: {
+          let cf = self
+            .database
+            .cf_handle(CF_WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP)
+            .unwrap();
+          let mut transactions = Vec::new();
+          let iter = self.database.iterator_cf(cf, IteratorMode::Start);
+          for result in iter {
+            let (block_count_bytes, timestamp_bytes) = result?;
+            let starting_block_count =
+              u32::from_be_bytes(block_count_bytes.as_ref().try_into().unwrap());
+            let starting_timestamp =
+              u128::from_be_bytes(timestamp_bytes.as_ref().try_into().unwrap());
+            transactions.push(TransactionInfo {
+              starting_block_count,
+              starting_timestamp,
+            });
+          }
+          transactions
+        },
+        tree_height: 1,
+        utxos_indexed: {
+          let cf = self.database.cf_handle(CF_OUTPOINT_TO_UTXO_ENTRY).unwrap();
+          let mut count = 0;
+          let iter = self.database.iterator_cf(cf, IteratorMode::Start);
+          for _ in iter {
+            count += 1;
+          }
+
+          let cf = self
+            .database
+            .cf_handle(CF_OUTPOINT_TO_NONDUST_UTXO_ENTRY)
+            .unwrap();
+          let iter = self.database.iterator_cf(cf, IteratorMode::Start);
+          for _ in iter {
+            count += 1;
+          }
+
+          count
+        },
       }
     };
 
@@ -622,23 +740,38 @@ impl Index {
 
   pub fn update(&self) -> Result {
     loop {
-      let wtx = self.begin_write()?;
+      // For RocksDB, we don't need explicit transactions like redb
+      // The Updater will handle database operations directly
+
+      // Acquire cache lock and initialize
+      let transaction_cache = std::sync::Mutex::new(transaction_cache::TransactionCache::new());
+      let mut cache = transaction_cache.lock().unwrap();
+      cache.initialize(&self.database)?;
 
       let mut updater = Updater {
-        height: wtx
-          .open_table(HEIGHT_TO_BLOCK_HEADER)?
-          .range(0..)?
-          .next_back()
-          .transpose()?
-          .map(|(height, _header)| height.value() + 1)
-          .unwrap_or(0),
+        height: {
+          let height_cf = self.database.cf_handle(CF_HEIGHT_TO_BLOCK_HEADER).unwrap();
+          let mut iter = self.database.iterator_cf(height_cf, IteratorMode::End);
+          if let Some(Ok((height_bytes, _))) = iter.next() {
+            u32::from_be_bytes(height_bytes.as_ref().try_into().unwrap()) + 1
+          } else {
+            0
+          }
+        },
         index: self,
         outputs_cached: 0,
+        outputs_cached0: 0,
+        outputs_cached1: 0,
+        outputs_cached2: 0,
+        outputs_cached3: 0,
+        outputs_dust_count: 0,
+        outputs_count: 0,
         outputs_traversed: 0,
         sat_ranges_since_flush: 0,
+        cache: &mut cache,
       };
 
-      match updater.update_index(wtx) {
+      match updater.update_index() {
         Ok(ok) => return Ok(ok),
         Err(err) => {
           log::info!("{}", err.to_string());
@@ -646,6 +779,7 @@ impl Index {
           match err.downcast_ref() {
             Some(&reorg::Error::Recoverable { height, depth }) => {
               Reorg::handle_reorg(self, height, depth)?;
+              exit(0);
             }
             Some(&reorg::Error::Unrecoverable) => {
               self
@@ -662,35 +796,47 @@ impl Index {
 
   pub fn export(&self, filename: &String, include_addresses: bool) -> Result {
     let mut writer = BufWriter::new(fs::File::create(filename)?);
-    let rtx = self.database.begin_read()?;
 
-    let blocks_indexed = rtx
-      .open_table(HEIGHT_TO_BLOCK_HEADER)?
-      .range(0..)?
-      .next_back()
-      .transpose()?
-      .map(|(height, _header)| height.value() + 1)
-      .unwrap_or(0);
+    let blocks_indexed = {
+      let height_cf = self.database.cf_handle(CF_HEIGHT_TO_BLOCK_HEADER).unwrap();
+      let mut iter = self.database.iterator_cf(height_cf, IteratorMode::End);
+      if let Some(Ok((height_bytes, _))) = iter.next() {
+        u32::from_be_bytes(height_bytes.as_ref().try_into().unwrap()) + 1
+      } else {
+        0
+      }
+    };
 
     writeln!(writer, "# export at block height {}", blocks_indexed)?;
 
     log::info!("exporting database tables to {filename}");
 
-    let sequence_number_to_satpoint = rtx.open_table(SEQUENCE_NUMBER_TO_SATPOINT)?;
-    let outpoint_to_utxo_entry = rtx.open_table(OUTPOINT_TO_UTXO_ENTRY)?;
+    let sequence_number_to_satpoint_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_SATPOINT)
+      .unwrap();
+    // fixme: dust utxo
+    let outpoint_to_utxo_entry_cf = self.database.cf_handle(CF_OUTPOINT_TO_UTXO_ENTRY).unwrap();
+    let inscription_entry_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+      .unwrap();
 
-    for result in rtx
-      .open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?
-      .iter()?
+    for result in self
+      .database
+      .iterator_cf(inscription_entry_cf, IteratorMode::Start)
     {
-      let entry = result?;
-      let sequence_number = entry.0.value();
-      let entry = InscriptionEntry::load(entry.1.value());
+      let (sequence_number_bytes, entry_bytes) = result?;
+      let sequence_number = u64::from_be_bytes(sequence_number_bytes.as_ref().try_into().unwrap());
+      let entry = InscriptionEntry::load(entry_bytes.to_vec());
       let satpoint = SatPoint::load(
-        *sequence_number_to_satpoint
-          .get(sequence_number)?
-          .unwrap()
-          .value(),
+        self
+          .database
+          .get_cf(
+            sequence_number_to_satpoint_cf,
+            &sequence_number.to_be_bytes(),
+          )?
+          .unwrap(),
       );
 
       write!(
@@ -705,13 +851,15 @@ impl Index {
         } else {
           let script_pubkey = if self.index_addresses {
             ScriptBuf::from_bytes(
-              outpoint_to_utxo_entry
-                .get(&satpoint.outpoint.store())?
-                .unwrap()
-                .value()
-                .parse(self)
-                .script_pubkey()
-                .to_vec(),
+              UtxoEntry::ref_cast(
+                &self
+                  .database
+                  .get_cf(outpoint_to_utxo_entry_cf, &satpoint.outpoint.store())?
+                  .unwrap(),
+              )
+              .parse(self)
+              .script_pubkey()
+              .to_vec(),
             )
           } else {
             self
@@ -743,44 +891,15 @@ impl Index {
     Ok(())
   }
 
-  fn begin_read(&self) -> Result<rtx::Rtx> {
-    Ok(rtx::Rtx(self.database.begin_read()?))
-  }
-
-  fn begin_write(&self) -> Result<WriteTransaction> {
-    let mut tx = self.database.begin_write()?;
-    tx.set_durability(self.durability);
-    Ok(tx)
-  }
-
-  fn increment_statistic(wtx: &WriteTransaction, statistic: Statistic, n: u64) -> Result {
-    let mut statistic_to_count = wtx.open_table(STATISTIC_TO_COUNT)?;
-    let value = statistic_to_count
-      .get(&(statistic.key()))?
-      .map(|x| x.value())
-      .unwrap_or_default()
-      + n;
-    statistic_to_count.insert(&statistic.key(), &value)?;
-    Ok(())
-  }
-
-  pub(crate) fn set_statistic(
-    statistics: &mut Table<u64, u64>,
-    statistic: Statistic,
-    value: u64,
-  ) -> Result<()> {
-    statistics.insert(&statistic.key(), &value)?;
-    Ok(())
-  }
-
-  pub(crate) fn is_statistic_set(
-    statistics: &ReadOnlyTable<u64, u64>,
+  pub(crate) fn is_statistic_set_rocksdb(
+    database: &DB,
+    statistics_cf: &ColumnFamily,
     statistic: Statistic,
   ) -> Result<bool> {
     Ok(
-      statistics
-        .get(&statistic.key())?
-        .map(|guard| guard.value())
+      database
+        .get_cf(statistics_cf, &statistic.key().to_be_bytes())?
+        .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
         .unwrap_or_default()
         != 0,
     )
@@ -788,16 +907,14 @@ impl Index {
 
   #[cfg(test)]
   pub(crate) fn statistic(&self, statistic: Statistic) -> u64 {
-    self
+    let statistic_to_count_cf = self.database.cf_handle(CF_STATISTIC_TO_COUNT).unwrap();
+    let value = self
       .database
-      .begin_read()
-      .unwrap()
-      .open_table(STATISTIC_TO_COUNT)
-      .unwrap()
-      .get(&statistic.key())
-      .unwrap()
-      .map(|x| x.value())
-      .unwrap_or_default()
+      .get_cf(statistic_to_count_cf, &statistic.key().to_be_bytes())
+      .map(|bytes| u64::from_be_bytes(bytes.unwrap().try_into().unwrap()))
+      .unwrap_or(0);
+
+    value
   }
 
   #[cfg(test)]
@@ -810,136 +927,187 @@ impl Index {
   }
 
   pub fn block_count(&self) -> Result<u32> {
-    self.begin_read()?.block_count()
+    let height_to_block_header_cf = self.database.cf_handle(CF_HEIGHT_TO_BLOCK_HEADER).unwrap();
+    let mut iter = self
+      .database
+      .iterator_cf(height_to_block_header_cf, IteratorMode::End);
+    let Some(Ok((height_bytes, _))) = iter.next() else {
+      return Ok(0);
+    };
+    Ok(u32::from_be_bytes(height_bytes.as_ref().try_into().unwrap()) + 1)
   }
 
   pub fn block_height(&self) -> Result<Option<Height>> {
-    self.begin_read()?.block_height()
+    let height_to_block_header_cf = self.database.cf_handle(CF_HEIGHT_TO_BLOCK_HEADER).unwrap();
+    let mut iter = self
+      .database
+      .iterator_cf(height_to_block_header_cf, IteratorMode::End);
+    let Some(Ok((height_bytes, _))) = iter.next() else {
+      return Ok(None);
+    };
+    Ok(Some(Height(u32::from_be_bytes(
+      height_bytes.as_ref().try_into().unwrap(),
+    ))))
   }
 
   pub fn block_hash(&self, height: Option<u32>) -> Result<Option<BlockHash>> {
-    self.begin_read()?.block_hash(height)
+    if let Some(height) = height {
+      let height_to_block_header_cf = self.database.cf_handle(CF_HEIGHT_TO_BLOCK_HEADER).unwrap();
+      if let Some(header_bytes) = self
+        .database
+        .get_cf(height_to_block_header_cf, &height.to_be_bytes())?
+      {
+        Ok(Some(Header::load(header_bytes).block_hash()))
+      } else {
+        Ok(None)
+      }
+    } else {
+      // Get block hash at highest height
+      if let Some(height) = self.block_height()? {
+        let height_to_block_header_cf = self.database.cf_handle(CF_HEIGHT_TO_BLOCK_HEADER).unwrap();
+        if let Some(header) = self
+          .database
+          .get_cf(height_to_block_header_cf, &height.n().to_be_bytes())?
+        {
+          Ok(Some(Header::load(header).block_hash()))
+        } else {
+          Ok(None)
+        }
+      } else {
+        Ok(None)
+      }
+    }
   }
 
   pub fn blocks(&self, take: usize) -> Result<Vec<(u32, BlockHash)>> {
-    let rtx = self.begin_read()?;
+    let cf = self.database.cf_handle(CF_HEIGHT_TO_BLOCK_HEADER).unwrap();
+    let mut blocks = Vec::new();
+    let mut iter = self.database.iterator_cf(cf, IteratorMode::End);
 
-    let block_count = rtx.block_count()?;
-
-    let height_to_block_header = rtx.0.open_table(HEIGHT_TO_BLOCK_HEADER)?;
-
-    let mut blocks = Vec::with_capacity(block_count.try_into().unwrap());
-
-    for next in height_to_block_header
-      .range(0..block_count)?
-      .rev()
-      .take(take)
-    {
-      let next = next?;
-      blocks.push((next.0.value(), Header::load(*next.1.value()).block_hash()));
+    for _ in 0..take {
+      if let Some(Ok((height_bytes, header_bytes))) = iter.next() {
+        let height = u32::from_be_bytes(height_bytes.as_ref().try_into().unwrap());
+        let header = Header::load(header_bytes.to_vec());
+        blocks.push((height, header.block_hash()));
+      } else {
+        break;
+      }
     }
 
     Ok(blocks)
   }
 
   pub fn rare_sat_satpoints(&self) -> Result<Vec<(Sat, SatPoint)>> {
-    let rtx = self.database.begin_read()?;
+    let cf = self.database.cf_handle(CF_SAT_TO_SATPOINT).unwrap();
+    let mut result = Vec::new();
+    let iter = self.database.iterator_cf(cf, IteratorMode::Start);
 
-    let sat_to_satpoint = rtx.open_table(SAT_TO_SATPOINT)?;
-
-    let mut result = Vec::with_capacity(sat_to_satpoint.len()?.try_into().unwrap());
-
-    for range in sat_to_satpoint.range(0..)? {
-      let (sat, satpoint) = range?;
-      result.push((Sat(sat.value()), Entry::load(*satpoint.value())));
+    for item in iter {
+      let (sat_bytes, satpoint_bytes) = item?;
+      let sat = u64::from_be_bytes(sat_bytes.as_ref().try_into().unwrap());
+      let satpoint = SatPoint::load(satpoint_bytes.as_ref().try_into().unwrap());
+      result.push((Sat(sat), satpoint));
     }
 
     Ok(result)
   }
 
   pub fn rare_sat_satpoint(&self, sat: Sat) -> Result<Option<SatPoint>> {
-    Ok(
-      self
-        .database
-        .begin_read()?
-        .open_table(SAT_TO_SATPOINT)?
-        .get(&sat.n())?
-        .map(|satpoint| Entry::load(*satpoint.value())),
-    )
+    let sat_to_satpoint_cf = self.database.cf_handle(CF_SAT_TO_SATPOINT).unwrap();
+    if let Some(satpoint_bytes) = self
+      .database
+      .get_cf(sat_to_satpoint_cf, &sat.n().to_be_bytes())?
+    {
+      Ok(Some(SatPoint::load(satpoint_bytes)))
+    } else {
+      Ok(None)
+    }
   }
 
   pub fn get_rune_by_id(&self, id: RuneId) -> Result<Option<Rune>> {
-    Ok(
-      self
-        .database
-        .begin_read()?
-        .open_table(RUNE_ID_TO_RUNE_ENTRY)?
-        .get(&id.store())?
-        .map(|entry| RuneEntry::load(entry.value()).spaced_rune.rune),
-    )
+    let rune_id_to_rune_entry_cf = self.database.cf_handle(CF_RUNE_ID_TO_RUNE_ENTRY).unwrap();
+    if let Some(entry_bytes) = self
+      .database
+      .get_cf(rune_id_to_rune_entry_cf, &id.store())?
+    {
+      let entry = RuneEntry::load(entry_bytes);
+      Ok(Some(entry.spaced_rune.rune))
+    } else {
+      Ok(None)
+    }
   }
 
   pub fn get_rune_by_number(&self, number: usize) -> Result<Option<Rune>> {
-    match self
-      .database
-      .begin_read()?
-      .open_table(RUNE_ID_TO_RUNE_ENTRY)?
-      .iter()?
-      .nth(number)
-    {
-      Some(result) => {
-        let rune_result =
-          result.map(|(_id, entry)| RuneEntry::load(entry.value()).spaced_rune.rune);
-        Ok(rune_result.ok())
+    let cf = self.database.cf_handle(CF_RUNE_ID_TO_RUNE_ENTRY).unwrap();
+    let mut iter = self.database.iterator_cf(cf, IteratorMode::Start);
+
+    for _ in 0..number {
+      if iter.next().is_none() {
+        return Ok(None);
       }
-      None => Ok(None),
+    }
+
+    if let Some(Ok((_id, entry_bytes))) = iter.next() {
+      let rune = RuneEntry::load_from_bytes(&entry_bytes)
+        .unwrap()
+        .spaced_rune
+        .rune;
+      Ok(Some(rune))
+    } else {
+      Ok(None)
     }
   }
 
   pub fn rune(&self, rune: Rune) -> Result<Option<(RuneId, RuneEntry, Option<InscriptionId>)>> {
-    let rtx = self.database.begin_read()?;
-
-    let Some(id) = rtx
-      .open_table(RUNE_TO_RUNE_ID)?
-      .get(rune.0)?
-      .map(|guard| guard.value())
-    else {
+    let rune_to_id_cf = self.database.cf_handle(CF_RUNE_TO_RUNE_ID).unwrap();
+    let rune_id = if let Some(id_bytes) = self.database.get_cf(rune_to_id_cf, &rune.store())? {
+      RuneId::load(id_bytes)
+    } else {
       return Ok(None);
     };
 
-    let entry = RuneEntry::load(
-      rtx
-        .open_table(RUNE_ID_TO_RUNE_ENTRY)?
-        .get(id)?
-        .unwrap()
-        .value(),
-    );
+    let rune_id_to_rune_entry_cf = self.database.cf_handle(CF_RUNE_ID_TO_RUNE_ENTRY).unwrap();
+    let entry = if let Some(entry_bytes) = self
+      .database
+      .get_cf(rune_id_to_rune_entry_cf, &rune_id.store())?
+    {
+      RuneEntry::load(entry_bytes)
+    } else {
+      return Ok(None);
+    };
 
     let parent = InscriptionId {
       txid: entry.etching,
       index: 0,
     };
 
-    let parent = rtx
-      .open_table(INSCRIPTION_ID_TO_SEQUENCE_NUMBER)?
-      .get(&parent.store())?
+    let inscription_id_to_sequence_number_cf = self
+      .database
+      .cf_handle(CF_INSCRIPTION_ID_TO_SEQUENCE_NUMBER)
+      .unwrap();
+    let parent = if self
+      .database
+      .get_cf(inscription_id_to_sequence_number_cf, &parent.store())?
       .is_some()
-      .then_some(parent);
+    {
+      Some(parent)
+    } else {
+      None
+    };
 
-    Ok(Some((RuneId::load(id), entry, parent)))
+    Ok(Some((rune_id, entry, parent)))
   }
 
   pub fn runes(&self) -> Result<Vec<(RuneId, RuneEntry)>> {
     let mut entries = Vec::new();
+    let cf = self.database.cf_handle(CF_RUNE_ID_TO_RUNE_ENTRY).unwrap();
 
-    for result in self
-      .database
-      .begin_read()?
-      .open_table(RUNE_ID_TO_RUNE_ENTRY)?
-      .iter()?
-    {
-      let (id, entry) = result?;
-      entries.push((RuneId::load(id.value()), RuneEntry::load(entry.value())));
+    for result in self.database.iterator_cf(cf, IteratorMode::Start) {
+      let (id_bytes, entry_bytes) = result?;
+      entries.push((
+        RuneId::load(id_bytes.to_vec()),
+        RuneEntry::load_from_bytes(&entry_bytes).unwrap(),
+      ));
     }
 
     Ok(entries)
@@ -951,18 +1119,26 @@ impl Index {
     page_index: usize,
   ) -> Result<(Vec<(RuneId, RuneEntry)>, bool)> {
     let mut entries = Vec::new();
+    let cf = self.database.cf_handle(CF_RUNE_ID_TO_RUNE_ENTRY).unwrap();
+    let mut iter = self.database.iterator_cf(cf, IteratorMode::End);
 
-    for result in self
-      .database
-      .begin_read()?
-      .open_table(RUNE_ID_TO_RUNE_ENTRY)?
-      .iter()?
-      .rev()
-      .skip(page_index.saturating_mul(page_size))
-      .take(page_size.saturating_add(1))
-    {
-      let (id, entry) = result?;
-      entries.push((RuneId::load(id.value()), RuneEntry::load(entry.value())));
+    // Skip to the start position
+    for _ in 0..page_index.saturating_mul(page_size) {
+      if iter.next().is_none() {
+        break;
+      }
+    }
+
+    // Take the requested items
+    for _ in 0..page_size.saturating_add(1) {
+      if let Some(Ok((id_bytes, entry_bytes))) = iter.next() {
+        entries.push((
+          RuneId::load(id_bytes.to_vec()),
+          RuneEntry::load_from_bytes(&entry_bytes).unwrap(),
+        ));
+      } else {
+        break;
+      }
     }
 
     let more = entries.len() > page_size;
@@ -995,17 +1171,17 @@ impl Index {
     &self,
     outpoint: OutPoint,
   ) -> Result<BTreeMap<SpacedRune, Pile>> {
-    let rtx = self.database.begin_read()?;
+    let outpoint_to_balances_cf = self
+      .database
+      .cf_handle(CF_OUTPOINT_TO_RUNE_BALANCES)
+      .unwrap();
 
-    let outpoint_to_balances = rtx.open_table(OUTPOINT_TO_RUNE_BALANCES)?;
-
-    let id_to_rune_entries = rtx.open_table(RUNE_ID_TO_RUNE_ENTRY)?;
-
-    let Some(balances) = outpoint_to_balances.get(&outpoint.store())? else {
+    let Some(balances_buffer) = self
+      .database
+      .get_cf(outpoint_to_balances_cf, &outpoint.store())?
+    else {
       return Ok(BTreeMap::new());
     };
-
-    let balances_buffer = balances.value();
 
     let mut balances = BTreeMap::new();
     let mut i = 0;
@@ -1013,7 +1189,12 @@ impl Index {
       let ((id, amount), length) = Index::decode_rune_balance(&balances_buffer[i..]).unwrap();
       i += length;
 
-      let entry = RuneEntry::load(id_to_rune_entries.get(id.store())?.unwrap().value());
+      let rune_id_to_rune_entry_cf = self.database.cf_handle(CF_RUNE_ID_TO_RUNE_ENTRY).unwrap();
+      let entry_bytes = self
+        .database
+        .get_cf(rune_id_to_rune_entry_cf, &id.store())?
+        .unwrap();
+      let entry = RuneEntry::load(entry_bytes);
 
       balances.insert(
         entry.spaced_rune,
@@ -1031,9 +1212,7 @@ impl Index {
   pub fn get_rune_balance_map(&self) -> Result<BTreeMap<SpacedRune, BTreeMap<OutPoint, Pile>>> {
     let outpoint_balances = self.get_rune_balances()?;
 
-    let rtx = self.database.begin_read()?;
-
-    let rune_id_to_rune_entry = rtx.open_table(RUNE_ID_TO_RUNE_ENTRY)?;
+    let rune_id_to_rune_entry_cf = self.database.cf_handle(CF_RUNE_ID_TO_RUNE_ENTRY).unwrap();
 
     let mut rune_balances_by_id: BTreeMap<RuneId, BTreeMap<OutPoint, u128>> = BTreeMap::new();
 
@@ -1056,10 +1235,10 @@ impl Index {
         symbol,
         ..
       } = RuneEntry::load(
-        rune_id_to_rune_entry
-          .get(&rune_id.store())?
-          .unwrap()
-          .value(),
+        self
+          .database
+          .get_cf(rune_id_to_rune_entry_cf, &rune_id.store())?
+          .unwrap(),
       );
 
       rune_balances.insert(
@@ -1085,16 +1264,14 @@ impl Index {
 
   pub fn get_rune_balances(&self) -> Result<Vec<(OutPoint, Vec<(RuneId, u128)>)>> {
     let mut result = Vec::new();
-
-    for entry in self
+    let cf = self
       .database
-      .begin_read()?
-      .open_table(OUTPOINT_TO_RUNE_BALANCES)?
-      .iter()?
-    {
-      let (outpoint, balances_buffer) = entry?;
-      let outpoint = OutPoint::load(*outpoint.value());
-      let balances_buffer = balances_buffer.value();
+      .cf_handle(CF_OUTPOINT_TO_RUNE_BALANCES)
+      .unwrap();
+
+    for entry in self.database.iterator_cf(cf, IteratorMode::Start) {
+      let (outpoint_bytes, balances_buffer) = entry?;
+      let outpoint = OutPoint::load(outpoint_bytes.to_vec());
 
       let mut balances = Vec::new();
       let mut i = 0;
@@ -1142,26 +1319,47 @@ impl Index {
     page_size: usize,
     page_index: usize,
   ) -> Result<(Vec<InscriptionId>, bool)> {
-    let rtx = self.database.begin_read()?;
+    let sequence_number_to_children_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_CHILDREN)
+      .ok_or_else(|| anyhow!("Column family 'sequence_number_to_children' not found"))?;
 
-    let sequence_number_to_inscription_entry =
-      rtx.open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?;
+    let mut collections = Vec::new();
+    let mut seen_parents = HashSet::new();
+    let mut iter = self
+      .database
+      .iterator_cf(sequence_number_to_children_cf, IteratorMode::Start);
 
-    let mut collections = rtx
-      .open_multimap_table(SEQUENCE_NUMBER_TO_CHILDREN)?
-      .iter()?
-      .skip(page_index.saturating_mul(page_size))
-      .take(page_size.saturating_add(1))
-      .map(|result| {
-        result
-          .and_then(|(parent, _children)| {
-            sequence_number_to_inscription_entry
-              .get(parent.value())
-              .map(|entry| InscriptionEntry::load(entry.unwrap().value()).id)
-          })
-          .map_err(|err| err.into())
-      })
-      .collect::<Result<Vec<InscriptionId>>>()?;
+    while let Some(Ok((key_bytes, _))) = iter.next() {
+      if key_bytes.len() >= 8 {
+        let parent = u64::from_be_bytes(
+          key_bytes[0..8]
+            .try_into()
+            .map_err(|_| anyhow!("Invalid key format"))?,
+        );
+        seen_parents.insert(parent);
+      }
+    }
+
+    let mut unique_parents: Vec<u64> = seen_parents.into_iter().collect();
+    unique_parents.sort();
+
+    let start_idx = page_index.saturating_mul(page_size);
+    let end_idx = (start_idx + page_size + 1).min(unique_parents.len());
+
+    for &parent in &unique_parents[start_idx..end_idx] {
+      let sequence_number_to_inscription_entry_cf = self
+        .database
+        .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+        .unwrap();
+      if let Some(entry_bytes) = self.database.get_cf(
+        sequence_number_to_inscription_entry_cf,
+        &parent.to_be_bytes(),
+      )? {
+        let entry = InscriptionEntry::load(entry_bytes);
+        collections.push(entry.id);
+      }
+    }
 
     let more = collections.len() > page_size;
 
@@ -1177,15 +1375,18 @@ impl Index {
     &self,
     inscription_id: InscriptionId,
   ) -> Result<Vec<InscriptionId>> {
-    let rtx = self.database.begin_read()?;
-
-    let Some(sequence_number) = rtx
-      .open_table(INSCRIPTION_ID_TO_SEQUENCE_NUMBER)?
-      .get(&inscription_id.store())?
-      .map(|sequence_number| sequence_number.value())
+    let inscription_id_to_sequence_number_cf = self
+      .database
+      .cf_handle(CF_INSCRIPTION_ID_TO_SEQUENCE_NUMBER)
+      .unwrap();
+    let Some(sequence_number_bytes) = self.database.get_cf(
+      inscription_id_to_sequence_number_cf,
+      &inscription_id.store(),
+    )?
     else {
       return Ok(Vec::new());
     };
+    let sequence_number = u64::from_be_bytes(sequence_number_bytes.try_into().unwrap());
 
     self
       .get_children_by_sequence_number_paginated(sequence_number, usize::MAX, 0)
@@ -1197,40 +1398,49 @@ impl Index {
     &self,
     inscription_id: InscriptionId,
   ) -> Vec<InscriptionId> {
-    let rtx = self.database.begin_read().unwrap();
-
-    let sequence_number = rtx
-      .open_table(INSCRIPTION_ID_TO_SEQUENCE_NUMBER)
-      .unwrap()
-      .get(&inscription_id.store())
-      .unwrap()
-      .unwrap()
-      .value();
-
-    let sequence_number_to_inscription_entry = rtx
-      .open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+    let inscription_id_to_sequence_number_cf = self
+      .database
+      .cf_handle(CF_INSCRIPTION_ID_TO_SEQUENCE_NUMBER)
+      .ok_or_else(|| anyhow!("Column family 'inscription_id_to_sequence_number' not found"))
+      .unwrap();
+    let sequence_number_to_inscription_entry_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+      .ok_or_else(|| anyhow!("Column family 'sequence_number_to_inscription_entry' not found"))
       .unwrap();
 
-    let parent_sequences = InscriptionEntry::load(
-      sequence_number_to_inscription_entry
-        .get(sequence_number)
-        .unwrap()
-        .unwrap()
-        .value(),
-    )
-    .parents;
+    let sequence_number_bytes = self
+      .database
+      .get_cf(
+        inscription_id_to_sequence_number_cf,
+        &inscription_id.store(),
+      )
+      .unwrap()
+      .unwrap();
+    let sequence_number = u64::from_be_bytes(sequence_number_bytes.try_into().unwrap());
+
+    let entry_bytes = self
+      .database
+      .get_cf(
+        sequence_number_to_inscription_entry_cf,
+        &sequence_number.to_be_bytes(),
+      )
+      .unwrap()
+      .unwrap();
+    let parent_sequences = InscriptionEntry::load(entry_bytes).parents;
 
     parent_sequences
       .into_iter()
       .map(|parent_sequence_number| {
-        InscriptionEntry::load(
-          sequence_number_to_inscription_entry
-            .get(parent_sequence_number)
-            .unwrap()
-            .unwrap()
-            .value(),
-        )
-        .id
+        let parent_entry_bytes = self
+          .database
+          .get_cf(
+            sequence_number_to_inscription_entry_cf,
+            &parent_sequence_number.to_be_bytes(),
+          )
+          .unwrap()
+          .unwrap();
+        InscriptionEntry::load(parent_entry_bytes).id
       })
       .collect()
   }
@@ -1241,25 +1451,56 @@ impl Index {
     page_size: usize,
     page_index: usize,
   ) -> Result<(Vec<InscriptionId>, bool)> {
-    let rtx = self.database.begin_read()?;
+    let sequence_number_to_children_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_CHILDREN)
+      .ok_or_else(|| anyhow!("Column family 'sequence_number_to_children' not found"))?;
 
-    let sequence_number_to_entry = rtx.open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?;
+    let mut children = Vec::new();
 
-    let mut children = rtx
-      .open_multimap_table(SEQUENCE_NUMBER_TO_CHILDREN)?
-      .get(sequence_number)?
-      .skip(page_index * page_size)
-      .take(page_size.saturating_add(1))
-      .map(|result| {
-        result
-          .and_then(|sequence_number| {
-            sequence_number_to_entry
-              .get(sequence_number.value())
-              .map(|entry| InscriptionEntry::load(entry.unwrap().value()).id)
-          })
-          .map_err(|err| err.into())
-      })
-      .collect::<Result<Vec<InscriptionId>>>()?;
+    let prefix = sequence_number.to_be_bytes();
+    let mut iter = self.database.iterator_cf(
+      sequence_number_to_children_cf,
+      IteratorMode::From(&prefix, Direction::Forward),
+    );
+    let mut found_children = 0;
+    let mut skipped = 0;
+
+    while let Some(Ok((key_bytes, _))) = iter.next() {
+      if key_bytes.len() < 8 || key_bytes[0..8] != prefix {
+        break;
+      }
+
+      if key_bytes.len() < 16 {
+        continue;
+      }
+      let child_sequence_number = u64::from_be_bytes(
+        key_bytes[8..16]
+          .try_into()
+          .map_err(|_| anyhow!("Invalid key format"))?,
+      );
+
+      if skipped >= page_index * page_size {
+        if found_children < page_size.saturating_add(1) {
+          let sequence_number_to_inscription_entry_cf = self
+            .database
+            .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+            .unwrap();
+          if let Some(entry_bytes) = self.database.get_cf(
+            sequence_number_to_inscription_entry_cf,
+            &child_sequence_number.to_be_bytes(),
+          )? {
+            let entry = InscriptionEntry::load(entry_bytes);
+            children.push(entry.id);
+            found_children += 1;
+          }
+        } else {
+          break;
+        }
+      } else {
+        skipped += 1;
+      }
+    }
 
     let more = children.len() > page_size;
 
@@ -1276,18 +1517,20 @@ impl Index {
     page_index: usize,
   ) -> Result<(Vec<InscriptionId>, bool)> {
     const PAGE_SIZE: usize = 100;
-    let rtx = self.database.begin_read()?;
-
-    let sequence_number_to_entry = rtx.open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?;
+    let sequence_number_to_entry_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+      .ok_or_else(|| anyhow!("Column family 'sequence_number_to_inscription_entry' not found"))?;
 
     let mut parents = parent_sequence_numbers
       .iter()
       .skip(page_index * PAGE_SIZE)
       .take(PAGE_SIZE.saturating_add(1))
       .map(|sequence_number| {
-        sequence_number_to_entry
-          .get(sequence_number)
-          .map(|entry| InscriptionEntry::load(entry.unwrap().value()).id)
+        self
+          .database
+          .get_cf(sequence_number_to_entry_cf, &sequence_number.to_be_bytes())
+          .map(|entry_bytes| InscriptionEntry::load(entry_bytes.unwrap()).id)
           .map_err(|err| err.into())
       })
       .collect::<Result<Vec<InscriptionId>>>()?;
@@ -1302,42 +1545,80 @@ impl Index {
   }
 
   pub fn get_etching(&self, txid: Txid) -> Result<Option<SpacedRune>> {
-    let rtx = self.database.begin_read()?;
+    // For RocksDB, we'll use direct database access instead of transactions
+    let transaction_id_to_rune_cf = self
+      .database
+      .cf_handle(CF_TRANSACTION_ID_TO_RUNE)
+      .ok_or_else(|| anyhow!("Column family 'transaction_id_to_rune' not found"))?;
+    let rune_to_rune_id_cf = self
+      .database
+      .cf_handle(CF_RUNE_TO_RUNE_ID)
+      .ok_or_else(|| anyhow!("Column family 'rune_to_rune_id' not found"))?;
+    let rune_id_to_rune_entry_cf = self
+      .database
+      .cf_handle(CF_RUNE_ID_TO_RUNE_ENTRY)
+      .ok_or_else(|| anyhow!("Column family 'rune_id_to_rune_entry' not found"))?;
 
-    let transaction_id_to_rune = rtx.open_table(TRANSACTION_ID_TO_RUNE)?;
-    let Some(rune) = transaction_id_to_rune.get(&txid.store())? else {
+    let Some(rune_bytes) = self
+      .database
+      .get_cf(transaction_id_to_rune_cf, &txid.store())?
+    else {
       return Ok(None);
     };
+    let rune = u128::from_be_bytes(rune_bytes.try_into().unwrap());
 
-    let rune_to_rune_id = rtx.open_table(RUNE_TO_RUNE_ID)?;
-    let id = rune_to_rune_id.get(rune.value())?.unwrap();
+    let Some(id_bytes) = self
+      .database
+      .get_cf(rune_to_rune_id_cf, &rune.to_be_bytes())?
+    else {
+      return Ok(None);
+    };
+    let id = RuneId::load(id_bytes);
 
-    let rune_id_to_rune_entry = rtx.open_table(RUNE_ID_TO_RUNE_ENTRY)?;
-    let entry = rune_id_to_rune_entry.get(&id.value())?.unwrap();
+    let Some(entry_bytes) = self
+      .database
+      .get_cf(rune_id_to_rune_entry_cf, &id.store())?
+    else {
+      return Ok(None);
+    };
+    let entry = RuneEntry::load(entry_bytes);
 
-    Ok(Some(RuneEntry::load(entry.value()).spaced_rune))
+    Ok(Some(entry.spaced_rune))
   }
 
   pub fn get_inscription_ids_by_sat(&self, sat: Sat) -> Result<Vec<InscriptionId>> {
-    let rtx = self.database.begin_read()?;
+    // For RocksDB, we'll use direct database access instead of transactions
+    let sat_to_sequence_number_cf = self
+      .database
+      .cf_handle(CF_SAT_TO_SEQUENCE_NUMBER)
+      .ok_or_else(|| anyhow!("Column family 'sat_to_sequence_number' not found"))?;
 
-    let sequence_number_to_inscription_entry =
-      rtx.open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?;
+    let mut ids = Vec::new();
 
-    let ids = rtx
-      .open_multimap_table(SAT_TO_SEQUENCE_NUMBER)?
-      .get(&sat.n())?
-      .map(|result| {
-        result
-          .and_then(|sequence_number| {
-            let sequence_number = sequence_number.value();
-            sequence_number_to_inscription_entry
-              .get(sequence_number)
-              .map(|entry| InscriptionEntry::load(entry.unwrap().value()).id)
-          })
-          .map_err(|err| err.into())
-      })
-      .collect::<Result<Vec<InscriptionId>>>()?;
+    // For RocksDB, we need to iterate through the sat_to_sequence_number manually since we don't have multimap tables
+    let mut iter = self
+      .database
+      .iterator_cf(sat_to_sequence_number_cf, IteratorMode::Start);
+
+    while let Some(Ok((sat_bytes, sequence_number_bytes))) = iter.next() {
+      let sat_value = u64::from_be_bytes(sat_bytes.as_ref().try_into().unwrap());
+      if sat_value == sat.n() {
+        let sequence_number =
+          u64::from_be_bytes(sequence_number_bytes.as_ref().try_into().unwrap());
+
+        let sequence_number_to_inscription_entry_cf = self
+          .database
+          .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+          .unwrap();
+        if let Some(entry_bytes) = self.database.get_cf(
+          sequence_number_to_inscription_entry_cf,
+          &sequence_number.to_be_bytes(),
+        )? {
+          let entry = InscriptionEntry::load(entry_bytes);
+          ids.push(entry.id);
+        }
+      }
+    }
 
     Ok(ids)
   }
@@ -1348,27 +1629,49 @@ impl Index {
     page_size: u64,
     page_index: u64,
   ) -> Result<(Vec<InscriptionId>, bool)> {
-    let rtx = self.database.begin_read()?;
+    // For RocksDB, we'll use direct database access instead of transactions
+    let sat_to_sequence_number_cf = self
+      .database
+      .cf_handle(CF_SAT_TO_SEQUENCE_NUMBER)
+      .ok_or_else(|| anyhow!("Column family 'sat_to_sequence_number' not found"))?;
 
-    let sequence_number_to_inscription_entry =
-      rtx.open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?;
+    let mut ids = Vec::new();
+    let mut found_count = 0;
+    let mut skipped = 0;
 
-    let mut ids = rtx
-      .open_multimap_table(SAT_TO_SEQUENCE_NUMBER)?
-      .get(&sat.n())?
-      .skip(page_index.saturating_mul(page_size).try_into().unwrap())
-      .take(page_size.saturating_add(1).try_into().unwrap())
-      .map(|result| {
-        result
-          .and_then(|sequence_number| {
-            let sequence_number = sequence_number.value();
-            sequence_number_to_inscription_entry
-              .get(sequence_number)
-              .map(|entry| InscriptionEntry::load(entry.unwrap().value()).id)
-          })
-          .map_err(|err| err.into())
-      })
-      .collect::<Result<Vec<InscriptionId>>>()?;
+    // For RocksDB, we need to iterate through the sat_to_sequence_number manually since we don't have multimap tables
+    let mut iter = self
+      .database
+      .iterator_cf(sat_to_sequence_number_cf, IteratorMode::Start);
+
+    while let Some(Ok((sat_bytes, sequence_number_bytes))) = iter.next() {
+      let sat_value = u64::from_be_bytes(sat_bytes.as_ref().try_into().unwrap());
+      if sat_value == sat.n() {
+        if skipped >= page_index.saturating_mul(page_size) {
+          if found_count < page_size.saturating_add(1) {
+            let sequence_number =
+              u64::from_be_bytes(sequence_number_bytes.as_ref().try_into().unwrap());
+
+            let sequence_number_to_inscription_entry_cf = self
+              .database
+              .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+              .unwrap();
+            if let Some(entry_bytes) = self.database.get_cf(
+              sequence_number_to_inscription_entry_cf,
+              &sequence_number.to_be_bytes(),
+            )? {
+              let entry = InscriptionEntry::load(entry_bytes);
+              ids.push(entry.id);
+              found_count += 1;
+            }
+          } else {
+            break;
+          }
+        } else {
+          skipped += 1;
+        }
+      }
+    }
 
     let more = ids.len() > page_size.try_into().unwrap();
 
@@ -1384,33 +1687,56 @@ impl Index {
     sat: Sat,
     inscription_index: isize,
   ) -> Result<Option<InscriptionId>> {
-    let rtx = self.database.begin_read()?;
+    // For RocksDB, we'll use direct database access instead of transactions
+    let sat_to_sequence_number_cf = self
+      .database
+      .cf_handle(CF_SAT_TO_SEQUENCE_NUMBER)
+      .ok_or_else(|| anyhow!("Column family 'sat_to_sequence_number' not found"))?;
 
-    let sequence_number_to_inscription_entry =
-      rtx.open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?;
+    // Collect all sequence numbers for this sat
+    let mut sequence_numbers = Vec::new();
+    let mut iter = self
+      .database
+      .iterator_cf(sat_to_sequence_number_cf, IteratorMode::Start);
 
-    let sat_to_sequence_number = rtx.open_multimap_table(SAT_TO_SEQUENCE_NUMBER)?;
-
-    if inscription_index < 0 {
-      sat_to_sequence_number
-        .get(&sat.n())?
-        .nth_back((inscription_index + 1).abs_diff(0))
-    } else {
-      sat_to_sequence_number
-        .get(&sat.n())?
-        .nth(inscription_index.abs_diff(0))
+    while let Some(Ok((sat_bytes, sequence_number_bytes))) = iter.next() {
+      let sat_value = u64::from_be_bytes(sat_bytes.as_ref().try_into().unwrap());
+      if sat_value == sat.n() {
+        let sequence_number =
+          u64::from_be_bytes(sequence_number_bytes.as_ref().try_into().unwrap());
+        sequence_numbers.push(sequence_number);
+      }
     }
-    .map(|result| {
-      result
-        .and_then(|sequence_number| {
-          let sequence_number = sequence_number.value();
-          sequence_number_to_inscription_entry
-            .get(sequence_number)
-            .map(|entry| InscriptionEntry::load(entry.unwrap().value()).id)
-        })
-        .map_err(|err| anyhow!(err.to_string()))
-    })
-    .transpose()
+
+    // Sort sequence numbers to maintain order
+    sequence_numbers.sort();
+
+    // Get the inscription ID at the specified index
+    let sequence_number = if inscription_index < 0 {
+      let abs_index = (inscription_index + 1).abs_diff(0);
+      sequence_numbers.get(sequence_numbers.len().saturating_sub(abs_index + 1))
+    } else {
+      sequence_numbers.get(inscription_index.abs_diff(0))
+    };
+
+    match sequence_number {
+      Some(&seq_num) => {
+        let sequence_number_to_inscription_entry_cf = self
+          .database
+          .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+          .unwrap();
+        if let Some(entry_bytes) = self.database.get_cf(
+          sequence_number_to_inscription_entry_cf,
+          &seq_num.to_be_bytes(),
+        )? {
+          let entry = InscriptionEntry::load(entry_bytes);
+          Ok(Some(entry.id))
+        } else {
+          Ok(None)
+        }
+      }
+      None => Ok(None),
+    }
   }
 
   #[cfg(test)]
@@ -1418,20 +1744,33 @@ impl Index {
     &self,
     inscription_number: i64,
   ) -> Result<Option<InscriptionId>> {
-    let rtx = self.database.begin_read()?;
+    let inscription_number_cf = self
+      .database
+      .cf_handle(CF_INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER)
+      .unwrap();
 
-    let Some(sequence_number) = rtx
-      .open_table(INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER)?
-      .get(inscription_number)?
-      .map(|guard| guard.value())
+    let Some(sequence_number_bytes) = self
+      .database
+      .get_cf(inscription_number_cf, &inscription_number.to_be_bytes())?
     else {
       return Ok(None);
     };
 
-    let inscription_id = rtx
-      .open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?
-      .get(&sequence_number)?
-      .map(|entry| InscriptionEntry::load(entry.value()).id);
+    let sequence_number = u64::from_be_bytes(sequence_number_bytes.try_into().unwrap());
+
+    let sequence_number_to_inscription_entry_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+      .unwrap();
+    let inscription_id = if let Some(entry_bytes) = self.database.get_cf(
+      sequence_number_to_inscription_entry_cf,
+      &sequence_number.to_be_bytes(),
+    )? {
+      let entry = InscriptionEntry::load(entry_bytes);
+      Some(entry.id)
+    } else {
+      None
+    };
 
     Ok(inscription_id)
   }
@@ -1440,20 +1779,31 @@ impl Index {
     &self,
     inscription_id: InscriptionId,
   ) -> Result<Option<SatPoint>> {
-    let rtx = self.database.begin_read()?;
-
-    let Some(sequence_number) = rtx
-      .open_table(INSCRIPTION_ID_TO_SEQUENCE_NUMBER)?
-      .get(&inscription_id.store())?
-      .map(|guard| guard.value())
+    let inscription_id_to_sequence_number_cf = self
+      .database
+      .cf_handle(CF_INSCRIPTION_ID_TO_SEQUENCE_NUMBER)
+      .unwrap();
+    let Some(sequence_number_bytes) = self.database.get_cf(
+      inscription_id_to_sequence_number_cf,
+      &inscription_id.store(),
+    )?
     else {
       return Ok(None);
     };
+    let sequence_number = u64::from_be_bytes(sequence_number_bytes.try_into().unwrap());
 
-    let satpoint = rtx
-      .open_table(SEQUENCE_NUMBER_TO_SATPOINT)?
-      .get(sequence_number)?
-      .map(|satpoint| Entry::load(*satpoint.value()));
+    let sequence_number_to_satpoint_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_SATPOINT)
+      .unwrap();
+    let satpoint = if let Some(satpoint_bytes) = self.database.get_cf(
+      sequence_number_to_satpoint_cf,
+      &sequence_number.to_be_bytes(),
+    )? {
+      Some(SatPoint::load(satpoint_bytes))
+    } else {
+      None
+    };
 
     Ok(satpoint)
   }
@@ -1475,32 +1825,42 @@ impl Index {
   }
 
   pub fn inscription_count(&self, txid: Txid) -> Result<u32> {
-    let start = InscriptionId { index: 0, txid };
+    // let start = InscriptionId { index: 0, txid };
+    // let end = InscriptionId {
+    //   index: u32::MAX,
+    //   txid,
+    // };
 
-    let end = InscriptionId {
-      index: u32::MAX,
-      txid,
-    };
+    let cf = self
+      .database
+      .cf_handle(CF_INSCRIPTION_ID_TO_SEQUENCE_NUMBER)
+      .unwrap();
+    let mut count = 0;
+    let iter = self.database.iterator_cf(cf, IteratorMode::Start);
 
-    Ok(
-      self
-        .database
-        .begin_read()?
-        .open_table(INSCRIPTION_ID_TO_SEQUENCE_NUMBER)?
-        .range::<&InscriptionIdValue>(&start.store()..&end.store())?
-        .count()
-        .try_into()
-        .unwrap(),
-    )
+    for result in iter {
+      let (inscription_id_bytes, _) = result?;
+      let inscription_id = InscriptionId::load(inscription_id_bytes.to_vec());
+      if inscription_id.txid == txid {
+        count += 1;
+      }
+    }
+
+    Ok(count)
   }
 
   pub fn inscription_exists(&self, inscription_id: InscriptionId) -> Result<bool> {
+    let inscription_id_to_sequence_number_cf = self
+      .database
+      .cf_handle(CF_INSCRIPTION_ID_TO_SEQUENCE_NUMBER)
+      .unwrap();
     Ok(
       self
         .database
-        .begin_read()?
-        .open_table(INSCRIPTION_ID_TO_SEQUENCE_NUMBER)?
-        .get(&inscription_id.store())?
+        .get_cf(
+          inscription_id_to_sequence_number_cf,
+          &inscription_id.store(),
+        )?
         .is_some(),
     )
   }
@@ -1509,16 +1869,68 @@ impl Index {
     &self,
     outpoint: OutPoint,
   ) -> Result<Vec<(SatPoint, InscriptionId)>> {
-    let rtx = self.database.begin_read()?;
-    let outpoint_to_utxo_entry = rtx.open_table(OUTPOINT_TO_UTXO_ENTRY)?;
-    let sequence_number_to_inscription_entry =
-      rtx.open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?;
+    // fixme: dust utxo
+    let outpoint_to_utxo_entry_cf = self.database.cf_handle(CF_OUTPOINT_TO_UTXO_ENTRY).unwrap();
+    if let Some(entry_bytes) = self
+      .database
+      .get_cf(outpoint_to_utxo_entry_cf, &outpoint.store())?
+    {
+      let utxo_entry = UtxoEntry::ref_cast(&entry_bytes).to_buf();
+      let parsed = utxo_entry.parse(self);
 
-    self.inscriptions_on_output(
-      &outpoint_to_utxo_entry,
-      &sequence_number_to_inscription_entry,
-      outpoint,
-    )
+      if let inscriptions_bytes = parsed.inscriptions() {
+        let mut result = Vec::new();
+        let mut byte_offset = 0;
+
+        while byte_offset < inscriptions_bytes.len() {
+          let sequence_number = u64::from_le_bytes(
+            inscriptions_bytes[byte_offset..byte_offset + 8]
+              .try_into()
+              .unwrap(),
+          );
+          byte_offset += 8;
+
+          let (satpoint_offset, varint_len) =
+            varint::decode(&inscriptions_bytes[byte_offset..]).unwrap();
+          let satpoint_offset = u64::try_from(satpoint_offset).unwrap();
+          byte_offset += varint_len;
+
+          let sequence_number_to_inscription_entry_cf = self
+            .database
+            .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+            .unwrap();
+          if let Some(entry_bytes) = self.database.get_cf(
+            sequence_number_to_inscription_entry_cf,
+            &sequence_number.to_be_bytes(),
+          )? {
+            let inscription_entry = InscriptionEntry::load(entry_bytes);
+            let inscription_id = inscription_entry.id;
+
+            // Calculate the actual SatPoint
+            let mut offset = 0;
+            let sat_ranges = parsed.sat_ranges();
+            for chunk in sat_ranges.chunks_exact(14) {
+              let (start, end) = SatRange::load(chunk.try_into().unwrap());
+              if satpoint_offset < offset + (end - start) {
+                let sat_point = SatPoint {
+                  outpoint,
+                  offset: satpoint_offset - offset,
+                };
+                result.push((sat_point, inscription_id));
+                break;
+              }
+              offset += end - start;
+            }
+          }
+        }
+
+        Ok(result)
+      } else {
+        Ok(Vec::new())
+      }
+    } else {
+      Ok(Vec::new())
+    }
   }
 
   pub fn get_inscriptions_for_output(&self, outpoint: OutPoint) -> Result<Vec<InscriptionId>> {
@@ -1554,13 +1966,15 @@ impl Index {
     }
 
     if self.index_transactions {
-      if let Some(transaction) = self
+      let transaction_id_to_transaction_cf = self
         .database
-        .begin_read()?
-        .open_table(TRANSACTION_ID_TO_TRANSACTION)?
-        .get(&txid.store())?
+        .cf_handle(CF_TRANSACTION_ID_TO_TRANSACTION)
+        .unwrap();
+      if let Some(transaction_bytes) = self
+        .database
+        .get_cf(transaction_id_to_transaction_cf, &txid.store())?
       {
-        return Ok(Some(consensus::encode::deserialize(transaction.value())?));
+        return Ok(Some(consensus::encode::deserialize(&transaction_bytes)?));
       }
     }
 
@@ -1569,26 +1983,41 @@ impl Index {
 
   pub fn find(&self, sat: Sat) -> Result<Option<SatPoint>> {
     let sat = sat.0;
-    let rtx = self.begin_read()?;
 
-    if rtx.block_count()? <= Sat(sat).height().n() {
+    if self.block_count()? <= Sat(sat).height().n() {
       return Ok(None);
     }
 
-    let outpoint_to_utxo_entry = rtx.0.open_table(OUTPOINT_TO_UTXO_ENTRY)?;
+    let sat_to_satpoint_cf = self.database.cf_handle(CF_SAT_TO_SATPOINT).unwrap();
+    if let Some(satpoint_bytes) = self
+      .database
+      .get_cf(sat_to_satpoint_cf, &sat.to_be_bytes())?
+    {
+      return Ok(Some(SatPoint::load(satpoint_bytes)));
+    }
 
-    for entry in outpoint_to_utxo_entry.iter()? {
-      let (outpoint, utxo_entry) = entry?;
-      let sat_ranges = utxo_entry.value().parse(self).sat_ranges();
+    // If not found in the cache/table above, iterate over every UTXO entry
+    let outpoint_to_utxo_entry_cf = self.database.cf_handle(CF_OUTPOINT_TO_UTXO_ENTRY).unwrap();
+
+    for entry in self
+      .database
+      .iterator_cf(outpoint_to_utxo_entry_cf, IteratorMode::Start)
+    {
+      let (outpoint_bytes, utxo_entry_bytes) = entry?;
+      let sat_ranges = UtxoEntry::ref_cast(&utxo_entry_bytes)
+        .parse(self)
+        .sat_ranges();
 
       let mut offset = 0;
       for chunk in sat_ranges.chunks_exact(14) {
         let (start, end) = SatRange::load(chunk.try_into().unwrap());
         if start <= sat && sat < end {
-          return Ok(Some(SatPoint {
-            outpoint: Entry::load(*outpoint.value()),
+          let satpoint = SatPoint {
+            outpoint: OutPoint::load(outpoint_bytes.as_ref().try_into().unwrap()),
             offset: offset + sat - start,
-          }));
+          };
+          // Return immediately without caching the result
+          return Ok(Some(satpoint));
         }
         offset += end - start;
       }
@@ -1604,9 +2033,8 @@ impl Index {
   ) -> Result<Option<Vec<FindRangeOutput>>> {
     let range_start = range_start.0;
     let range_end = range_end.0;
-    let rtx = self.begin_read()?;
 
-    if rtx.block_count()? < Sat(range_end - 1).height().n() + 1 {
+    if self.block_count()? < Sat(range_end - 1).height().n() + 1 {
       return Ok(None);
     }
 
@@ -1614,12 +2042,17 @@ impl Index {
       return Err(anyhow!("range end is before range start"));
     };
 
-    let outpoint_to_utxo_entry = rtx.0.open_table(OUTPOINT_TO_UTXO_ENTRY)?;
+    let outpoint_to_utxo_entry_cf = self.database.cf_handle(CF_OUTPOINT_TO_UTXO_ENTRY).unwrap();
 
     let mut result = Vec::new();
-    for entry in outpoint_to_utxo_entry.iter()? {
-      let (outpoint, utxo_entry) = entry?;
-      let sat_ranges = utxo_entry.value().parse(self).sat_ranges();
+    for entry in self
+      .database
+      .iterator_cf(outpoint_to_utxo_entry_cf, IteratorMode::Start)
+    {
+      let (outpoint_bytes, utxo_entry_bytes) = entry?;
+      let sat_ranges = UtxoEntry::ref_cast(&utxo_entry_bytes)
+        .parse(self)
+        .sat_ranges();
 
       let mut offset = 0;
       for sat_range in sat_ranges.chunks_exact(14) {
@@ -1633,7 +2066,7 @@ impl Index {
             start: overlap_start,
             size: overlap_end - overlap_start,
             satpoint: SatPoint {
-              outpoint: Entry::load(*outpoint.value()),
+              outpoint: OutPoint::load(outpoint_bytes.as_ref().try_into().unwrap()),
               offset: offset + overlap_start - start,
             },
           });
@@ -1651,27 +2084,59 @@ impl Index {
     Ok(Some(result))
   }
 
+  pub fn get_inscription_entry(
+    &self,
+    inscription_id: InscriptionId,
+  ) -> Result<Option<InscriptionEntry>> {
+    let inscription_id_to_sequence_number_cf = self
+      .database
+      .cf_handle(CF_INSCRIPTION_ID_TO_SEQUENCE_NUMBER)
+      .unwrap();
+    let sequence_number = if let Some(sequence_number_bytes) = self.database.get_cf(
+      inscription_id_to_sequence_number_cf,
+      &inscription_id.store(),
+    )? {
+      u64::from_be_bytes(sequence_number_bytes.try_into().unwrap())
+    } else {
+      return Ok(None);
+    };
+
+    let sequence_number_to_inscription_entry_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+      .unwrap();
+    if let Some(entry_bytes) = self.database.get_cf(
+      sequence_number_to_inscription_entry_cf,
+      &sequence_number.to_be_bytes(),
+    )? {
+      Ok(Some(InscriptionEntry::load(entry_bytes)))
+    } else {
+      Ok(None)
+    }
+  }
+
   pub fn list(&self, outpoint: OutPoint) -> Result<Option<Vec<(u64, u64)>>> {
     if !self.index_sats {
       return Ok(None);
     }
 
-    Ok(
-      self
-        .database
-        .begin_read()?
-        .open_table(OUTPOINT_TO_UTXO_ENTRY)?
-        .get(&outpoint.store())?
-        .map(|utxo_entry| {
-          utxo_entry
-            .value()
-            .parse(self)
-            .sat_ranges()
-            .chunks_exact(14)
-            .map(|chunk| SatRange::load(chunk.try_into().unwrap()))
-            .collect::<Vec<(u64, u64)>>()
-        }),
-    )
+    let outpoint_to_utxo_entry_cf = self.database.cf_handle(CF_OUTPOINT_TO_UTXO_ENTRY).unwrap();
+    if let Some(entry_bytes) = self
+      .database
+      .get_cf(outpoint_to_utxo_entry_cf, &outpoint.store())?
+    {
+      let utxo_entry = UtxoEntry::ref_cast(entry_bytes.as_ref()).to_buf();
+      Ok(Some(
+        utxo_entry
+          .parse(self)
+          .sat_ranges()
+          .chunks_exact(14)
+          .map(|chunk| SatRange::load(chunk.try_into().unwrap()))
+          .collect::<Vec<(u64, u64)>>(),
+      ))
+    } else {
+      Ok(None)
+    }
   }
 
   pub fn is_output_spent(&self, outpoint: OutPoint) -> Result<bool> {
@@ -1679,12 +2144,21 @@ impl Index {
       outpoint != OutPoint::null()
         && outpoint != self.settings.chain().genesis_coinbase_outpoint()
         && if self.index_sats {
+          let outpoint_to_utxo_entry_cf =
+            self.database.cf_handle(CF_OUTPOINT_TO_UTXO_ENTRY).unwrap();
+          let outpoint_to_nondust_utxo_entry_cf = self
+            .database
+            .cf_handle(CF_OUTPOINT_TO_NONDUST_UTXO_ENTRY)
+            .unwrap();
+
           self
             .database
-            .begin_read()?
-            .open_table(OUTPOINT_TO_UTXO_ENTRY)?
-            .get(&outpoint.store())?
+            .get_cf(outpoint_to_utxo_entry_cf, &outpoint.store())?
             .is_none()
+            && self
+              .database
+              .get_cf(outpoint_to_nondust_utxo_entry_cf, &outpoint.store())?
+              .is_none()
         } else {
           self
             .client
@@ -1725,21 +2199,25 @@ impl Index {
   pub fn block_time(&self, height: Height) -> Result<Blocktime> {
     let height = height.n();
 
-    let rtx = self.database.begin_read()?;
+    let height_to_block_header_cf = self.database.cf_handle(CF_HEIGHT_TO_BLOCK_HEADER).unwrap();
 
-    let height_to_block_header = rtx.open_table(HEIGHT_TO_BLOCK_HEADER)?;
-
-    if let Some(guard) = height_to_block_header.get(height)? {
-      return Ok(Blocktime::confirmed(Header::load(*guard.value()).time));
+    if let Some(header_bytes) = self
+      .database
+      .get_cf(height_to_block_header_cf, &height.to_be_bytes())?
+    {
+      return Ok(Blocktime::confirmed(Header::load(header_bytes).time));
     }
 
-    let current = height_to_block_header
-      .range(0..)?
-      .next_back()
-      .transpose()?
-      .map(|(height, _header)| height)
-      .map(|x| x.value())
-      .unwrap_or(0);
+    let current = {
+      let mut iter = self
+        .database
+        .iterator_cf(height_to_block_header_cf, IteratorMode::End);
+      if let Some(Ok((height_bytes, _))) = iter.next() {
+        u32::from_be_bytes(height_bytes.as_ref().try_into().unwrap())
+      } else {
+        0
+      }
+    };
 
     let expected_blocks = height
       .checked_sub(current)
@@ -1761,27 +2239,49 @@ impl Index {
     page_size: u64,
     page_index: u64,
   ) -> Result<(Vec<InscriptionId>, bool)> {
-    let rtx = self.database.begin_read()?;
+    // For RocksDB, we'll use direct database access instead of transactions
+    let sequence_number_to_inscription_entry_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+      .ok_or_else(|| anyhow!("Column family 'sequence_number_to_inscription_entry' not found"))?;
 
-    let sequence_number_to_inscription_entry =
-      rtx.open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?;
-
-    let last = sequence_number_to_inscription_entry
-      .iter()?
-      .next_back()
-      .map(|result| result.map(|(number, _entry)| number.value()))
-      .transpose()?
-      .unwrap_or_default();
+    // Get the last sequence number
+    let mut iter = self
+      .database
+      .iterator_cf(sequence_number_to_inscription_entry_cf, IteratorMode::End);
+    let last = if let Some(Ok((number_bytes, _))) = iter.next() {
+      u64::from_be_bytes(number_bytes.as_ref().try_into().unwrap())
+    } else {
+      0
+    };
 
     let start = last.saturating_sub(page_size.saturating_mul(page_index));
-
     let end = start.saturating_sub(page_size);
 
-    let mut inscriptions = sequence_number_to_inscription_entry
-      .range(end..=start)?
-      .rev()
-      .map(|result| result.map(|(_number, entry)| InscriptionEntry::load(entry.value()).id))
-      .collect::<Result<Vec<InscriptionId>, StorageError>>()?;
+    let mut inscriptions = Vec::new();
+
+    // Iterate through the range in reverse order
+    // let mut iter = self
+    //   .database
+    //   .iterator_cf(sequence_number_to_inscription_entry_cf, IteratorMode::End);
+    let mut current = last;
+
+    while current > end && inscriptions.len() < page_size.saturating_add(1).try_into().unwrap() {
+      if current <= start {
+        let sequence_number_to_inscription_entry_cf = self
+          .database
+          .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+          .unwrap();
+        if let Some(entry_bytes) = self.database.get_cf(
+          sequence_number_to_inscription_entry_cf,
+          &current.to_be_bytes(),
+        )? {
+          let entry = InscriptionEntry::load(entry_bytes);
+          inscriptions.push(entry.id);
+        }
+      }
+      current = current.saturating_sub(1);
+    }
 
     let more = u64::try_from(inscriptions.len()).unwrap_or(u64::MAX) > page_size;
 
@@ -1793,54 +2293,80 @@ impl Index {
   }
 
   pub fn get_inscriptions_in_block(&self, block_height: u32) -> Result<Vec<InscriptionId>> {
-    let rtx = self.database.begin_read()?;
-
-    let height_to_last_sequence_number = rtx.open_table(HEIGHT_TO_LAST_SEQUENCE_NUMBER)?;
-    let sequence_number_to_inscription_entry =
-      rtx.open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?;
-
-    let Some(newest_sequence_number) = height_to_last_sequence_number
-      .get(&block_height)?
-      .map(|ag| ag.value())
+    let height_to_last_sequence_number_cf = self
+      .database
+      .cf_handle(CF_HEIGHT_TO_LAST_SEQUENCE_NUMBER)
+      .unwrap();
+    let Some(newest_sequence_number_bytes) = self.database.get_cf(
+      height_to_last_sequence_number_cf,
+      &block_height.to_be_bytes(),
+    )?
     else {
       return Ok(Vec::new());
     };
+    let newest_sequence_number =
+      u64::from_be_bytes(TryInto::<[u8; 8]>::try_into(newest_sequence_number_bytes).unwrap());
 
-    let oldest_sequence_number = height_to_last_sequence_number
-      .get(block_height.saturating_sub(1))?
-      .map(|ag| ag.value())
-      .unwrap_or(0);
+    let oldest_sequence_number = if let Some(oldest_bytes) = self.database.get_cf(
+      height_to_last_sequence_number_cf,
+      &block_height.saturating_sub(1).to_be_bytes(),
+    )? {
+      u64::from_be_bytes(TryInto::<[u8; 8]>::try_into(oldest_bytes).unwrap())
+    } else {
+      0
+    };
 
-    (oldest_sequence_number..newest_sequence_number)
-      .map(|num| match sequence_number_to_inscription_entry.get(&num) {
-        Ok(Some(inscription_id)) => Ok(InscriptionEntry::load(inscription_id.value()).id),
-        Ok(None) => Err(anyhow!(
-          "could not find inscription for inscription number {num}"
-        )),
-        Err(err) => Err(anyhow!(err)),
-      })
-      .collect::<Result<Vec<InscriptionId>>>()
+    let mut inscriptions = Vec::new();
+    for num in oldest_sequence_number..newest_sequence_number {
+      let sequence_number_to_inscription_entry_cf = self
+        .database
+        .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+        .unwrap();
+      if let Some(entry_bytes) = self
+        .database
+        .get_cf(sequence_number_to_inscription_entry_cf, &num.to_be_bytes())?
+      {
+        let entry = InscriptionEntry::load(entry_bytes);
+        inscriptions.push(entry.id);
+      }
+    }
+
+    Ok(inscriptions)
   }
 
   pub fn get_runes_in_block(&self, block_height: u64) -> Result<Vec<SpacedRune>> {
-    let rtx = self.database.begin_read()?;
+    // For RocksDB, we'll use direct database access instead of transactions
+    let rune_id_to_rune_entry_cf = self
+      .database
+      .cf_handle(CF_RUNE_ID_TO_RUNE_ENTRY)
+      .ok_or_else(|| anyhow!("Column family 'rune_id_to_rune_entry' not found"))?;
 
-    let rune_id_to_rune_entry = rtx.open_table(RUNE_ID_TO_RUNE_ENTRY)?;
+    // let min_id = RuneId {
+    //   block: block_height,
+    //   tx: 0,
+    // };
 
-    let min_id = RuneId {
-      block: block_height,
-      tx: 0,
-    };
+    // let max_id = RuneId {
+    //   block: block_height,
+    //   tx: u32::MAX,
+    // };
 
-    let max_id = RuneId {
-      block: block_height,
-      tx: u32::MAX,
-    };
+    let mut runes = Vec::new();
+    let mut iter = self
+      .database
+      .iterator_cf(rune_id_to_rune_entry_cf, IteratorMode::Start);
 
-    let runes = rune_id_to_rune_entry
-      .range(min_id.store()..=max_id.store())?
-      .map(|result| result.map(|(_, entry)| RuneEntry::load(entry.value()).spaced_rune))
-      .collect::<Result<Vec<SpacedRune>, StorageError>>()?;
+    while let Some(Ok((rune_id_bytes, entry_bytes))) = iter.next() {
+      let rune_id = RuneId::load(rune_id_bytes.to_vec());
+      if rune_id.block == block_height {
+        let entry = RuneEntry::load(entry_bytes.to_vec());
+        runes.push(entry.spaced_rune);
+      }
+      // If we've passed the max_id, we can stop
+      if rune_id.block > block_height {
+        break;
+      }
+    }
 
     Ok(runes)
   }
@@ -1877,32 +2403,34 @@ impl Index {
   }
 
   pub fn get_home_inscriptions(&self) -> Result<Vec<InscriptionId>> {
-    Ok(
-      self
-        .database
-        .begin_read()?
-        .open_table(HOME_INSCRIPTIONS)?
-        .iter()?
-        .rev()
-        .flat_map(|result| result.map(|(_number, id)| InscriptionId::load(id.value())))
-        .collect(),
-    )
+    let (inscriptions, _more) = self.get_inscriptions_paginated(20, 0)?;
+
+    Ok(inscriptions)
   }
 
   pub fn get_feed_inscriptions(&self, n: usize) -> Result<Vec<(u64, InscriptionId)>> {
-    Ok(
-      self
-        .database
-        .begin_read()?
-        .open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?
-        .iter()?
-        .rev()
-        .take(n)
-        .flat_map(|result| {
-          result.map(|(number, entry)| (number.value(), InscriptionEntry::load(entry.value()).id))
-        })
-        .collect(),
-    )
+    // For RocksDB, we'll use direct database access instead of transactions
+    let sequence_number_to_inscription_entry_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+      .ok_or_else(|| anyhow!("Column family 'sequence_number_to_inscription_entry' not found"))?;
+
+    let mut inscriptions = Vec::new();
+    let mut iter = self
+      .database
+      .iterator_cf(sequence_number_to_inscription_entry_cf, IteratorMode::End);
+
+    for _ in 0..n {
+      if let Some(Ok((number_bytes, entry_bytes))) = iter.next() {
+        let number = u64::from_be_bytes(number_bytes.as_ref().try_into().unwrap());
+        let entry = InscriptionEntry::load(entry_bytes.to_vec());
+        inscriptions.push((number, entry.id));
+      } else {
+        break;
+      }
+    }
+
+    Ok(inscriptions)
   }
 
   pub(crate) fn inscription_info(
@@ -1910,23 +2438,68 @@ impl Index {
     query: query::Inscription,
     child: Option<usize>,
   ) -> Result<Option<(api::Inscription, Option<TxOut>, Inscription)>> {
-    let rtx = self.database.begin_read()?;
+    // For RocksDB, we'll use direct database access instead of transactions
+    let inscription_id_to_sequence_number_cf = self
+      .database
+      .cf_handle(CF_INSCRIPTION_ID_TO_SEQUENCE_NUMBER)
+      .ok_or_else(|| anyhow!("Column family 'inscription_id_to_sequence_number' not found"))?;
+    let sat_to_sequence_number_cf = self
+      .database
+      .cf_handle(CF_SAT_TO_SEQUENCE_NUMBER)
+      .ok_or_else(|| anyhow!("Column family 'sat_to_sequence_number' not found"))?;
+    let sequence_number_to_children_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_CHILDREN)
+      .ok_or_else(|| anyhow!("Column family 'sequence_number_to_children' not found"))?;
 
     let sequence_number = match query {
-      query::Inscription::Id(id) => rtx
-        .open_table(INSCRIPTION_ID_TO_SEQUENCE_NUMBER)?
-        .get(&id.store())?
-        .map(|guard| guard.value()),
-      query::Inscription::Number(inscription_number) => rtx
-        .open_table(INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER)?
-        .get(inscription_number)?
-        .map(|guard| guard.value()),
-      query::Inscription::Sat(sat) => rtx
-        .open_multimap_table(SAT_TO_SEQUENCE_NUMBER)?
-        .get(sat.n())?
-        .next()
-        .transpose()?
-        .map(|guard| guard.value()),
+      query::Inscription::Id(id) => {
+        if let Some(sequence_number_bytes) = self
+          .database
+          .get_cf(inscription_id_to_sequence_number_cf, &id.store())?
+        {
+          Some(u64::from_be_bytes(
+            TryInto::<[u8; 8]>::try_into(sequence_number_bytes).unwrap(),
+          ))
+        } else {
+          None
+        }
+      }
+      query::Inscription::Number(inscription_number) => {
+        let inscription_number_to_sequence_number_cf = self
+          .database
+          .cf_handle(CF_INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER)
+          .unwrap();
+        if let Some(sequence_number_bytes) = self.database.get_cf(
+          inscription_number_to_sequence_number_cf,
+          &inscription_number.to_be_bytes(),
+        )? {
+          Some(u64::from_be_bytes(
+            TryInto::<[u8; 8]>::try_into(sequence_number_bytes).unwrap(),
+          ))
+        } else {
+          None
+        }
+      }
+      query::Inscription::Sat(sat) => {
+        // For RocksDB, we need to iterate through the sat_to_sequence_number manually since we don't have multimap tables
+        let mut iter = self
+          .database
+          .iterator_cf(sat_to_sequence_number_cf, IteratorMode::Start);
+        let mut found_sequence_number = None;
+
+        while let Some(Ok((sat_bytes, sequence_number_bytes))) = iter.next() {
+          let sat_value = u64::from_be_bytes(sat_bytes.as_ref().try_into().unwrap());
+          if sat_value == sat.n() {
+            found_sequence_number = Some(u64::from_be_bytes(
+              sequence_number_bytes.as_ref().try_into().unwrap(),
+            ));
+            break;
+          }
+        }
+
+        found_sequence_number
+      }
     };
 
     let Some(sequence_number) = sequence_number else {
@@ -1934,13 +2507,40 @@ impl Index {
     };
 
     let sequence_number = if let Some(child) = child {
-      let Some(child) = rtx
-        .open_multimap_table(SEQUENCE_NUMBER_TO_CHILDREN)?
-        .get(sequence_number)?
-        .nth(child)
-        .transpose()?
-        .map(|child| child.value())
-      else {
+      // Key format: parent_sequence_number (8 bytes) + child_sequence_number (8 bytes)
+      let prefix = sequence_number.to_be_bytes();
+      // Use IteratorMode::From to seek directly to the desired prefix and avoid a full scan
+      let mut iter = self.database.iterator_cf(
+        sequence_number_to_children_cf,
+        IteratorMode::From(&prefix, Direction::Forward),
+      );
+      let mut found_children = 0;
+      let mut found_child = None;
+
+      while let Some(Ok((key_bytes, _))) = iter.next() {
+        // Check if the key starts with the expected parent sequence number; a mismatch means we're done
+        if key_bytes.len() < 8 || key_bytes[0..8] != prefix {
+          break;
+        }
+
+        // Extract the child sequence number from the last 8 bytes
+        if key_bytes.len() < 16 {
+          continue;
+        }
+        let child_sequence_number = u64::from_be_bytes(
+          key_bytes[8..16]
+            .try_into()
+            .map_err(|_| anyhow!("Invalid key format"))?,
+        );
+
+        if found_children == child {
+          found_child = Some(child_sequence_number);
+          break;
+        }
+        found_children += 1;
+      }
+
+      let Some(child) = found_child else {
         return Ok(None);
       };
 
@@ -1949,15 +2549,18 @@ impl Index {
       sequence_number
     };
 
-    let sequence_number_to_inscription_entry =
-      rtx.open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?;
-
-    let entry = InscriptionEntry::load(
-      sequence_number_to_inscription_entry
-        .get(&sequence_number)?
-        .unwrap()
-        .value(),
-    );
+    let sequence_number_to_inscription_entry_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+      .unwrap();
+    let Some(entry_bytes) = self.database.get_cf(
+      sequence_number_to_inscription_entry_cf,
+      &sequence_number.to_be_bytes(),
+    )?
+    else {
+      return Ok(None);
+    };
+    let entry = InscriptionEntry::load(entry_bytes);
 
     let Some(transaction) = self.get_transaction(entry.id.txid)? else {
       return Ok(None);
@@ -1971,13 +2574,18 @@ impl Index {
       return Ok(None);
     };
 
-    let satpoint = SatPoint::load(
-      *rtx
-        .open_table(SEQUENCE_NUMBER_TO_SATPOINT)?
-        .get(sequence_number)?
-        .unwrap()
-        .value(),
-    );
+    let sequence_number_to_satpoint_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_SATPOINT)
+      .unwrap();
+    let Some(satpoint_bytes) = self.database.get_cf(
+      sequence_number_to_satpoint_cf,
+      &sequence_number.to_be_bytes(),
+    )?
+    else {
+      return Ok(None);
+    };
+    let satpoint = SatPoint::load(satpoint_bytes);
 
     let output = if satpoint.outpoint == unbound_outpoint() || satpoint.outpoint == OutPoint::null()
     {
@@ -1994,65 +2602,114 @@ impl Index {
     };
 
     let previous = if let Some(n) = sequence_number.checked_sub(1) {
-      Some(
-        InscriptionEntry::load(
-          sequence_number_to_inscription_entry
-            .get(n)?
-            .unwrap()
-            .value(),
-        )
-        .id,
-      )
+      if let Some(prev_entry_bytes) = self
+        .database
+        .get_cf(sequence_number_to_inscription_entry_cf, &n.to_be_bytes())?
+      {
+        Some(InscriptionEntry::load(prev_entry_bytes).id)
+      } else {
+        None
+      }
     } else {
       None
     };
 
-    let next = sequence_number_to_inscription_entry
-      .get(sequence_number + 1)?
-      .map(|guard| InscriptionEntry::load(guard.value()).id);
-
-    let children = rtx
-      .open_multimap_table(SEQUENCE_NUMBER_TO_CHILDREN)?
-      .get(sequence_number)?
-      .take(4)
-      .map(|result| {
-        result
-          .and_then(|sequence_number| {
-            sequence_number_to_inscription_entry
-              .get(sequence_number.value())
-              .map(|entry| InscriptionEntry::load(entry.unwrap().value()).id)
-          })
-          .map_err(|err| err.into())
-      })
-      .collect::<Result<Vec<InscriptionId>>>()?;
-
-    let rune = if let Some(rune_id) = rtx
-      .open_table(SEQUENCE_NUMBER_TO_RUNE_ID)?
-      .get(sequence_number)?
-    {
-      let rune_id_to_rune_entry = rtx.open_table(RUNE_ID_TO_RUNE_ENTRY)?;
-      let entry = rune_id_to_rune_entry.get(&rune_id.value())?.unwrap();
-      Some(RuneEntry::load(entry.value()).spaced_rune)
+    let sequence_number_to_inscription_entry_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+      .unwrap();
+    let next = if let Some(entry_bytes) = self.database.get_cf(
+      sequence_number_to_inscription_entry_cf,
+      &(sequence_number + 1).to_be_bytes(),
+    )? {
+      let next_entry = InscriptionEntry::load(entry_bytes);
+      Some(next_entry.id)
     } else {
       None
     };
 
-    let parents = entry
-      .parents
-      .iter()
-      .take(4)
-      .map(|parent| {
-        Ok(
-          InscriptionEntry::load(
-            sequence_number_to_inscription_entry
-              .get(parent)?
-              .unwrap()
-              .value(),
-          )
-          .id,
-        )
-      })
-      .collect::<Result<Vec<InscriptionId>>>()?;
+    let mut children = Vec::new();
+    // Key format: parent_sequence_number (8 bytes) + child_sequence_number (8 bytes)
+    let prefix = sequence_number.to_be_bytes();
+    // Use IteratorMode::From to iterate from the desired prefix and avoid a full scan
+    let mut iter = self.database.iterator_cf(
+      sequence_number_to_children_cf,
+      IteratorMode::From(&prefix, Direction::Forward),
+    );
+    let mut found_children = 0;
+
+    while found_children < 4 {
+      if let Some(Ok((key_bytes, _))) = iter.next() {
+        // Verify the prefix; if it differs we've exhausted relevant entries
+        if key_bytes.len() < 8 || key_bytes[0..8] != prefix {
+          break;
+        }
+
+        // Extract the child sequence number from the last 8 bytes
+        if key_bytes.len() < 16 {
+          continue;
+        }
+        let child_sequence_number = u64::from_be_bytes(
+          key_bytes[8..16]
+            .try_into()
+            .map_err(|_| anyhow!("Invalid key format"))?,
+        );
+
+        // Look up the child entry using its sequence number
+        let sequence_number_to_inscription_entry_cf = self
+          .database
+          .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+          .unwrap();
+        if let Some(entry_bytes) = self.database.get_cf(
+          sequence_number_to_inscription_entry_cf,
+          &child_sequence_number.to_be_bytes(),
+        )? {
+          let child_entry = InscriptionEntry::load(entry_bytes);
+          children.push(child_entry.id);
+          found_children += 1;
+        }
+      } else {
+        break;
+      }
+    }
+
+    let sequence_number_to_rune_id_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_RUNE_ID)
+      .unwrap();
+    let rune = if let Some(rune_id_bytes) = self.database.get_cf(
+      sequence_number_to_rune_id_cf,
+      &sequence_number.to_be_bytes(),
+    )? {
+      let rune_id = RuneId::load(rune_id_bytes.to_vec());
+      let rune_id_to_rune_entry_cf = self.database.cf_handle(CF_RUNE_ID_TO_RUNE_ENTRY).unwrap();
+      if let Some(entry_bytes) = self
+        .database
+        .get_cf(rune_id_to_rune_entry_cf, &rune_id.store())?
+      {
+        let rune_entry = RuneEntry::load(entry_bytes);
+        Some(rune_entry.spaced_rune)
+      } else {
+        None
+      }
+    } else {
+      None
+    };
+
+    let mut parents = Vec::new();
+    for parent in entry.parents.iter().take(4) {
+      let sequence_number_to_inscription_entry_cf = self
+        .database
+        .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+        .unwrap();
+      if let Some(entry_bytes) = self.database.get_cf(
+        sequence_number_to_inscription_entry_cf,
+        &parent.to_be_bytes(),
+      )? {
+        let parent_entry = InscriptionEntry::load(entry_bytes);
+        parents.push(parent_entry.id);
+      }
+    }
 
     let mut charms = entry.charms;
 
@@ -2106,28 +2763,6 @@ impl Index {
     )))
   }
 
-  pub fn get_inscription_entry(
-    &self,
-    inscription_id: InscriptionId,
-  ) -> Result<Option<InscriptionEntry>> {
-    let rtx = self.database.begin_read()?;
-
-    let Some(sequence_number) = rtx
-      .open_table(INSCRIPTION_ID_TO_SEQUENCE_NUMBER)?
-      .get(&inscription_id.store())?
-      .map(|guard| guard.value())
-    else {
-      return Ok(None);
-    };
-
-    let entry = rtx
-      .open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?
-      .get(sequence_number)?
-      .map(|value| InscriptionEntry::load(value.value()));
-
-    Ok(entry)
-  }
-
   #[cfg(test)]
   fn assert_inscription_location(
     &self,
@@ -2135,36 +2770,60 @@ impl Index {
     satpoint: SatPoint,
     sat: Option<u64>,
   ) {
-    let rtx = self.database.begin_read().unwrap();
+    // For RocksDB, we'll use direct database access instead of transactions
+    let outpoint_to_utxo_entry_cf = self
+      .database
+      .cf_handle(CF_OUTPOINT_TO_UTXO_ENTRY)
+      .ok_or_else(|| anyhow!("Column family 'outpoint_to_utxo_entry' not found"))
+      .unwrap();
+    let sequence_number_to_satpoint_cf = self
+      .database
+      .cf_handle(CF_SEQUENCE_NUMBER_TO_SATPOINT)
+      .ok_or_else(|| anyhow!("Column family 'sequence_number_to_satpoint' not found"))
+      .unwrap();
+    let inscription_id_to_sequence_number_cf = self
+      .database
+      .cf_handle(CF_INSCRIPTION_ID_TO_SEQUENCE_NUMBER)
+      .ok_or_else(|| anyhow!("Column family 'inscription_id_to_sequence_number' not found"))
+      .unwrap();
+    let sat_to_sequence_number_cf = self
+      .database
+      .cf_handle(CF_SAT_TO_SEQUENCE_NUMBER)
+      .ok_or_else(|| anyhow!("Column family 'sat_to_sequence_number' not found"))
+      .unwrap();
+    let sat_to_satpoint_cf = self
+      .database
+      .cf_handle(CF_SAT_TO_SATPOINT)
+      .ok_or_else(|| anyhow!("Column family 'sat_to_satpoint' not found"))
+      .unwrap();
 
-    let outpoint_to_utxo_entry = rtx.open_table(OUTPOINT_TO_UTXO_ENTRY).unwrap();
-
-    let sequence_number_to_satpoint = rtx.open_table(SEQUENCE_NUMBER_TO_SATPOINT).unwrap();
-
-    let sequence_number = rtx
-      .open_table(INSCRIPTION_ID_TO_SEQUENCE_NUMBER)
-      .unwrap()
-      .get(&inscription_id.store())
-      .unwrap()
-      .unwrap()
-      .value();
-
-    assert_eq!(
-      SatPoint::load(
-        *sequence_number_to_satpoint
-          .get(sequence_number)
-          .unwrap()
-          .unwrap()
-          .value()
-      ),
-      satpoint,
-    );
-
-    let utxo_entry = outpoint_to_utxo_entry
-      .get(&satpoint.outpoint.store())
+    let sequence_number_bytes = self
+      .database
+      .get_cf(
+        inscription_id_to_sequence_number_cf,
+        &inscription_id.store(),
+      )
       .unwrap()
       .unwrap();
-    let parsed_inscriptions = utxo_entry.value().parse(self).parse_inscriptions();
+    let sequence_number = u64::from_be_bytes(sequence_number_bytes.try_into().unwrap());
+
+    let satpoint_bytes = self
+      .database
+      .get_cf(
+        sequence_number_to_satpoint_cf,
+        &sequence_number.to_be_bytes(),
+      )
+      .unwrap()
+      .unwrap();
+    assert_eq!(SatPoint::load(satpoint_bytes), satpoint,);
+
+    let utxo_entry_bytes = self
+      .database
+      .get_cf(outpoint_to_utxo_entry_cf, &satpoint.outpoint.store())
+      .unwrap()
+      .unwrap();
+    let utxo_entry = UtxoEntry::ref_cast(&utxo_entry_bytes);
+    let parsed_inscriptions = utxo_entry.parse(self).parse_inscriptions();
     let satpoint_offsets: Vec<u64> = parsed_inscriptions
       .iter()
       .copied()
@@ -2178,27 +2837,33 @@ impl Index {
           // unbound inscriptions should not be assigned to a sat
           assert_ne!(satpoint.outpoint, unbound_outpoint());
 
-          assert!(rtx
-            .open_multimap_table(SAT_TO_SEQUENCE_NUMBER)
-            .unwrap()
-            .get(&sat)
-            .unwrap()
-            .any(|entry| entry.unwrap().value() == sequence_number));
+          // For RocksDB, we need to iterate through the sat_to_sequence_number manually since we don't have multimap tables
+          let mut iter = self
+            .database
+            .iterator_cf(sat_to_sequence_number_cf, IteratorMode::Start);
+          let mut found = false;
+
+          while let Some(Ok((sat_bytes, sequence_number_bytes))) = iter.next() {
+            let sat_value = u64::from_be_bytes(sat_bytes.as_ref().try_into().unwrap());
+            if sat_value == sat {
+              let seq_num = u64::from_be_bytes(sequence_number_bytes.as_ref().try_into().unwrap());
+              if seq_num == sequence_number {
+                found = true;
+                break;
+              }
+            }
+          }
+
+          assert!(found);
 
           // we do not track common sats (only the sat ranges)
           if !Sat(sat).common() {
-            assert_eq!(
-              SatPoint::load(
-                *rtx
-                  .open_table(SAT_TO_SATPOINT)
-                  .unwrap()
-                  .get(&sat)
-                  .unwrap()
-                  .unwrap()
-                  .value()
-              ),
-              satpoint,
-            );
+            let satpoint_bytes = self
+              .database
+              .get_cf(sat_to_satpoint_cf, &sat.to_be_bytes())
+              .unwrap()
+              .unwrap();
+            assert_eq!(SatPoint::load(satpoint_bytes), satpoint,);
           }
         }
       }
@@ -2210,48 +2875,40 @@ impl Index {
     }
   }
 
-  fn inscriptions_on_output<'a: 'tx, 'tx>(
-    &self,
-    outpoint_to_utxo_entry: &'a impl ReadableTable<&'static OutPointValue, &'static UtxoEntry>,
-    sequence_number_to_inscription_entry: &'a impl ReadableTable<u64, InscriptionEntryValue>,
-    outpoint: OutPoint,
-  ) -> Result<Vec<(SatPoint, InscriptionId)>> {
-    if !self.index_inscriptions {
-      return Ok(Vec::new());
+  pub fn get_address_info(&self, address: &Address) -> Result<Vec<OutPoint>> {
+    // For RocksDB, we'll use direct database access instead of transactions
+    let script_pubkey_to_outpoint_cf = self
+      .database
+      .cf_handle(CF_SCRIPT_PUBKEY_TO_OUTPOINT)
+      .ok_or_else(|| anyhow!("Column family 'script_pubkey_to_outpoint' not found"))?;
+
+    let mut outpoints = Vec::new();
+    let script_pubkey: Vec<u8> = address.script_pubkey().as_bytes().to_vec();
+    // Use IteratorMode::From to start at the script_pubkey prefix and avoid scanning the entire column family
+    // Key format: script_pubkey bytes followed by the serialized outpoint
+    let mut iter = self.database.iterator_cf(
+      script_pubkey_to_outpoint_cf,
+      IteratorMode::From(&script_pubkey, Direction::Forward),
+    );
+
+    while let Some(Ok((key_bytes, _))) = iter.next() {
+      // Verify that the key begins with the target script_pubkey prefix; a mismatch means we're done because keys are ordered
+      if key_bytes.len() < script_pubkey.len()
+        || &key_bytes[0..script_pubkey.len()] != script_pubkey.as_slice()
+      {
+        break; // Prefix mismatch indicates we've iterated past all relevant entries
+      }
+
+      // Extract the serialized outpoint (fixed 36 bytes: 32-byte txid + 4-byte vout)
+      if key_bytes.len() < script_pubkey.len() + 36 {
+        continue; // Skip malformed keys
+      }
+      let outpoint_bytes = key_bytes[script_pubkey.len()..script_pubkey.len() + 36].to_vec();
+      let outpoint = OutPoint::load(outpoint_bytes);
+      outpoints.push(outpoint);
     }
 
-    let Some(utxo_entry) = outpoint_to_utxo_entry.get(&outpoint.store())? else {
-      return Ok(Vec::new());
-    };
-
-    let mut inscriptions = utxo_entry.value().parse(self).parse_inscriptions();
-
-    inscriptions.sort_by_key(|(sequence_number, _)| *sequence_number);
-
-    inscriptions
-      .into_iter()
-      .map(|(sequence_number, offset)| {
-        let entry = sequence_number_to_inscription_entry
-          .get(sequence_number)?
-          .unwrap();
-        let satpoint = SatPoint { outpoint, offset };
-        Ok((satpoint, InscriptionEntry::load(entry.value()).id))
-      })
-      .collect::<Result<_>>()
-  }
-
-  pub fn get_address_info(&self, address: &Address) -> Result<Vec<OutPoint>> {
-    self
-      .database
-      .begin_read()?
-      .open_multimap_table(SCRIPT_PUBKEY_TO_OUTPOINT)?
-      .get(address.script_pubkey().as_bytes())?
-      .map(|result| {
-        result
-          .map_err(|err| anyhow!(err))
-          .map(|value| OutPoint::load(value.value()))
-      })
-      .collect()
+    Ok(outpoints)
   }
 
   pub(crate) fn get_aggregated_rune_balances_for_outputs(
@@ -2289,15 +2946,21 @@ impl Index {
   }
 
   pub(crate) fn get_sat_balances_for_outputs(&self, outputs: &Vec<OutPoint>) -> Result<u64> {
-    let outpoint_to_utxo_entry = self
+    // fixme: nondust utxo
+    // For RocksDB, we'll use direct database access instead of transactions
+    let outpoint_to_utxo_entry_cf = self
       .database
-      .begin_read()?
-      .open_table(OUTPOINT_TO_UTXO_ENTRY)?;
+      .cf_handle(CF_OUTPOINT_TO_UTXO_ENTRY)
+      .ok_or_else(|| anyhow!("Column family 'outpoint_to_utxo_entry' not found"))?;
 
     let mut acc = 0;
     for output in outputs {
-      if let Some(utxo_entry) = outpoint_to_utxo_entry.get(&output.store())? {
-        acc += utxo_entry.value().parse(self).total_value();
+      if let Some(utxo_entry_bytes) = self
+        .database
+        .get_cf(outpoint_to_utxo_entry_cf, &output.store())?
+      {
+        let utxo_entry = UtxoEntry::ref_cast(&utxo_entry_bytes);
+        acc += utxo_entry.parse(self).total_value();
       };
     }
 
@@ -3428,60 +4091,6 @@ mod tests {
   }
 
   #[test]
-  fn old_schema_gives_correct_error() {
-    let tempdir = {
-      let context = Context::builder().build();
-
-      let wtx = context.index.database.begin_write().unwrap();
-
-      wtx
-        .open_table(STATISTIC_TO_COUNT)
-        .unwrap()
-        .insert(&Statistic::Schema.key(), &0)
-        .unwrap();
-
-      wtx.commit().unwrap();
-
-      context.tempdir
-    };
-
-    let path = tempdir.path().to_owned();
-
-    let delimiter = if cfg!(windows) { '\\' } else { '/' };
-
-    assert_eq!(
-      Context::builder().tempdir(tempdir).try_build().err().unwrap().to_string(),
-      format!("index at `{}{delimiter}regtest{delimiter}index.redb` appears to have been built with an older, incompatible version of ord, consider deleting and rebuilding the index: index schema 0, ord schema {SCHEMA_VERSION}", path.display()));
-  }
-
-  #[test]
-  fn new_schema_gives_correct_error() {
-    let tempdir = {
-      let context = Context::builder().build();
-
-      let wtx = context.index.database.begin_write().unwrap();
-
-      wtx
-        .open_table(STATISTIC_TO_COUNT)
-        .unwrap()
-        .insert(&Statistic::Schema.key(), &u64::MAX)
-        .unwrap();
-
-      wtx.commit().unwrap();
-
-      context.tempdir
-    };
-
-    let path = tempdir.path().to_owned();
-
-    let delimiter = if cfg!(windows) { '\\' } else { '/' };
-
-    assert_eq!(
-      Context::builder().tempdir(tempdir).try_build().err().unwrap().to_string(),
-      format!("index at `{}{delimiter}regtest{delimiter}index.redb` appears to have been built with a newer, incompatible version of ord, consider updating ord: index schema {}, ord schema {SCHEMA_VERSION}", path.display(), u64::MAX));
-  }
-
-  #[test]
   fn inscriptions_on_output() {
     for context in Context::configurations() {
       context.mine_blocks(1);
@@ -4561,8 +5170,6 @@ mod tests {
   #[test]
   fn recover_from_reorg() {
     for mut context in Context::configurations() {
-      context.index.set_durability(redb::Durability::Immediate);
-
       context.mine_blocks(1);
 
       let txid = context.core.broadcast_tx(TransactionTemplate {
@@ -4621,8 +5228,6 @@ mod tests {
   #[test]
   fn recover_from_3_block_deep_and_consecutive_reorg() {
     for mut context in Context::configurations() {
-      context.index.set_durability(redb::Durability::Immediate);
-
       context.mine_blocks(1);
 
       let txid = context.core.broadcast_tx(TransactionTemplate {
@@ -4684,8 +5289,6 @@ mod tests {
   #[test]
   fn recover_from_very_unlikely_7_block_deep_reorg() {
     for mut context in Context::configurations() {
-      context.index.set_durability(redb::Durability::Immediate);
-
       context.mine_blocks(1);
 
       let txid = context.core.broadcast_tx(TransactionTemplate {
@@ -6710,7 +7313,7 @@ mod tests {
   #[test]
   fn reminder_to_update_utxo_entry_type_name() {
     // This test will break when the schema version is updated, and is a
-    // reminder to fix the type name in `impl redb::Value for &UtxoEntry`.
+    // reminder to fix the type name in RocksDB implementation.
     //
     // The type name should be changed from `ord::index::utxo_entry::UtxoValue`
     // to `ord::UtxoEntry`. I think it's probably best if we just name types

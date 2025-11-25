@@ -105,12 +105,15 @@ impl Fetcher {
         res
           .result
           .ok_or_else(|| anyhow!("Missing result for batched JSON-RPC response"))
-          .and_then(|str| {
-            hex::decode(str)
-              .map_err(|e| anyhow!("Result for batched JSON-RPC response not valid hex: {e}"))
+          .and_then(|hex_str| {
+            let decoded_len = hex_str.len() / 2;
+            let mut buffer = vec![0u8; decoded_len];
+            hex::decode_to_slice(hex_str, &mut buffer)
+              .map_err(|e| anyhow!("Result for batched JSON-RPC response not valid hex: {e}"));
+            Ok(buffer)
           })
-          .and_then(|hex| {
-            consensus::deserialize(&hex).map_err(|e| {
+          .and_then(|buffer| {
+            consensus::deserialize(&buffer).map_err(|e| {
               anyhow!("Result for batched JSON-RPC response not valid bitcoin tx: {e}")
             })
           })

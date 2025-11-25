@@ -30,9 +30,11 @@ impl ContextBuilder {
       format!("--chain={}", self.chain).into(),
     ];
 
-    let options = Options::try_parse_from(command.into_iter().chain(self.args)).unwrap();
+    let arguments = Arguments::try_parse_from(command.into_iter().chain(self.args)).unwrap();
     let index = Index::open_with_event_sender(
-      &Settings::from_options(options).or_defaults().unwrap(),
+      &Settings::from_options(arguments.options)
+        .or_defaults()
+        .unwrap(),
       self.event_sender,
     )?;
     index.update().unwrap();

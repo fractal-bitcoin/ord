@@ -6,37 +6,48 @@ pub(crate) trait Entry: Sized {
   fn load(value: Self::Value) -> Self;
 
   fn store(self) -> Self::Value;
+
+  // Helper method to load from bytes for fixed-size array types
+  fn load_from_fixed_bytes<const N: usize>(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>>
+  where
+    Self::Value: From<[u8; N]>,
+  {
+    if bytes.len() != N {
+      return Err(format!("Expected {} bytes, got {}", N, bytes.len()).into());
+    }
+    let mut array = [0u8; N];
+    array.copy_from_slice(bytes);
+    Ok(Self::load(array.into()))
+  }
 }
 
-pub(super) type HeaderValue = [u8; 80];
+pub(super) type HeaderValue = Vec<u8>;
 
 impl Entry for Header {
   type Value = HeaderValue;
 
-  fn load(value: Self::Value) -> Self {
-    consensus::encode::deserialize(&value).unwrap()
+  fn load(data: Self::Value) -> Self {
+    ciborium::from_reader(&data[..]).unwrap()
   }
 
   fn store(self) -> Self::Value {
-    let mut buffer = Cursor::new([0; 80]);
-    let len = self
-      .consensus_encode(&mut buffer)
-      .expect("in-memory writers don't error");
-    let buffer = buffer.into_inner();
-    debug_assert_eq!(len, buffer.len());
-    buffer
+    let mut writer = Vec::new();
+    ciborium::into_writer(&self, &mut writer).unwrap();
+    writer
   }
 }
 
 impl Entry for Rune {
-  type Value = u128;
+  type Value = Vec<u8>;
 
-  fn load(value: Self::Value) -> Self {
-    Self(value)
+  fn load(data: Self::Value) -> Self {
+    ciborium::from_reader(&data[..]).unwrap()
   }
 
   fn store(self) -> Self::Value {
-    self.0
+    let mut writer = Vec::new();
+    ciborium::into_writer(&self, &mut writer).unwrap();
+    writer
   }
 }
 
@@ -144,28 +155,6 @@ impl RuneEntry {
   }
 }
 
-type TermsEntryValue = (
-  Option<u128>,               // cap
-  (Option<u64>, Option<u64>), // height
-  Option<u128>,               // amount
-  (Option<u64>, Option<u64>), // offset
-);
-
-pub(super) type RuneEntryValue = (
-  u64,                     // block
-  u128,                    // burned
-  u8,                      // divisibility
-  (u128, u128),            // etching
-  u128,                    // mints
-  u64,                     // number
-  u128,                    // premine
-  (u128, u32),             // spaced rune
-  Option<char>,            // symbol
-  Option<TermsEntryValue>, // terms
-  u64,                     // timestamp
-  bool,                    // turbo
-);
-
 impl Default for RuneEntry {
   fn default() -> Self {
     Self {
@@ -186,109 +175,42 @@ impl Default for RuneEntry {
 }
 
 impl Entry for RuneEntry {
-  type Value = RuneEntryValue;
+  type Value = Vec<u8>;
 
-  fn load(
-    (
-      block,
-      burned,
-      divisibility,
-      etching,
-      mints,
-      number,
-      premine,
-      (rune, spacers),
-      symbol,
-      terms,
-      timestamp,
-      turbo,
-    ): RuneEntryValue,
-  ) -> Self {
-    Self {
-      block,
-      burned,
-      divisibility,
-      etching: {
-        let low = etching.0.to_le_bytes();
-        let high = etching.1.to_le_bytes();
-        Txid::from_byte_array([
-          low[0], low[1], low[2], low[3], low[4], low[5], low[6], low[7], low[8], low[9], low[10],
-          low[11], low[12], low[13], low[14], low[15], high[0], high[1], high[2], high[3], high[4],
-          high[5], high[6], high[7], high[8], high[9], high[10], high[11], high[12], high[13],
-          high[14], high[15],
-        ])
-      },
-      mints,
-      number,
-      premine,
-      spaced_rune: SpacedRune {
-        rune: Rune(rune),
-        spacers,
-      },
-      symbol,
-      terms: terms.map(|(cap, height, amount, offset)| Terms {
-        cap,
-        height,
-        amount,
-        offset,
-      }),
-      timestamp,
-      turbo,
-    }
+  fn load(data: Self::Value) -> Self {
+    ciborium::from_reader(&data[..]).unwrap()
   }
 
   fn store(self) -> Self::Value {
-    (
-      self.block,
-      self.burned,
-      self.divisibility,
-      {
-        let bytes = self.etching.to_byte_array();
-        (
-          u128::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-          ]),
-          u128::from_le_bytes([
-            bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
-            bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
-          ]),
-        )
-      },
-      self.mints,
-      self.number,
-      self.premine,
-      (self.spaced_rune.rune.0, self.spaced_rune.spacers),
-      self.symbol,
-      self.terms.map(
-        |Terms {
-           cap,
-           height,
-           amount,
-           offset,
-         }| (cap, height, amount, offset),
-      ),
-      self.timestamp,
-      self.turbo,
-    )
+    let mut writer = Vec::new();
+    ciborium::into_writer(&self, &mut writer).unwrap();
+    writer
   }
 }
 
-pub(super) type RuneIdValue = (u64, u32);
+impl RuneEntry {
+  pub fn load_from_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+    Ok(ciborium::from_reader(bytes)?)
+  }
+}
+
+pub(super) type RuneIdValue = Vec<u8>;
 
 impl Entry for RuneId {
   type Value = RuneIdValue;
 
-  fn load((block, tx): Self::Value) -> Self {
-    Self { block, tx }
+  fn load(data: Self::Value) -> Self {
+    ciborium::from_reader(&data[..]).unwrap()
   }
 
   fn store(self) -> Self::Value {
-    (self.block, self.tx)
+    let mut writer = Vec::new();
+    ciborium::into_writer(&self, &mut writer).unwrap();
+    writer
   }
 }
 
-#[derive(Debug, Eq, PartialEq, Clone)]
+#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct InscriptionEntry {
   pub charms: u16,
   pub fee: u64,
@@ -301,197 +223,141 @@ pub struct InscriptionEntry {
   pub timestamp: u32,
 }
 
-pub(crate) type InscriptionEntryValue = (
-  u16,                // charms
-  u64,                // fee
-  u32,                // height
-  InscriptionIdValue, // inscription id
-  i64,                // inscription number
-  Vec<u64>,           // parents
-  Option<u64>,        // sat
-  u64,                // sequence number
-  u32,                // timestamp
-);
+pub(crate) type InscriptionEntryValue = Vec<u8>;
 
 impl Entry for InscriptionEntry {
   type Value = InscriptionEntryValue;
 
   #[rustfmt::skip]
-  fn load(
-    (
-      charms,
-      fee,
-      height,
-      id,
-      inscription_number,
-      parents,
-      sat,
-      sequence_number,
-      timestamp,
-    ): InscriptionEntryValue,
-  ) -> Self {
-    Self {
-      charms,
-      fee,
-      height,
-      id: InscriptionId::load(id),
-      inscription_number,
-      parents,
-      sat: sat.map(Sat),
-      sequence_number,
-      timestamp,
-    }
+  fn load(data: InscriptionEntryValue) -> Self {
+    ciborium::from_reader(&data[..]).unwrap()
   }
 
   fn store(self) -> Self::Value {
-    (
-      self.charms,
-      self.fee,
-      self.height,
-      self.id.store(),
-      self.inscription_number,
-      self.parents,
-      self.sat.map(Sat::n),
-      self.sequence_number,
-      self.timestamp,
-    )
+    let mut writer = Vec::new();
+    ciborium::into_writer(&self, &mut writer).unwrap();
+    writer
   }
 }
 
-pub(crate) type InscriptionIdValue = (u128, u128, u32);
+pub(crate) type InscriptionIdValue = Vec<u8>;
 
 impl Entry for InscriptionId {
-  type Value = InscriptionIdValue;
+  type Value = Vec<u8>;
 
-  fn load(value: Self::Value) -> Self {
-    let (head, tail, index) = value;
-    let head_array = head.to_le_bytes();
-    let tail_array = tail.to_le_bytes();
-    let array = [
-      head_array[0],
-      head_array[1],
-      head_array[2],
-      head_array[3],
-      head_array[4],
-      head_array[5],
-      head_array[6],
-      head_array[7],
-      head_array[8],
-      head_array[9],
-      head_array[10],
-      head_array[11],
-      head_array[12],
-      head_array[13],
-      head_array[14],
-      head_array[15],
-      tail_array[0],
-      tail_array[1],
-      tail_array[2],
-      tail_array[3],
-      tail_array[4],
-      tail_array[5],
-      tail_array[6],
-      tail_array[7],
-      tail_array[8],
-      tail_array[9],
-      tail_array[10],
-      tail_array[11],
-      tail_array[12],
-      tail_array[13],
-      tail_array[14],
-      tail_array[15],
-    ];
-
-    Self {
-      txid: Txid::from_byte_array(array),
-      index,
-    }
+  fn load(data: Self::Value) -> Self {
+    ciborium::from_reader(&data[..]).unwrap()
   }
 
   fn store(self) -> Self::Value {
-    let txid_entry = self.txid.store();
-    let little_end = u128::from_le_bytes(txid_entry[..16].try_into().unwrap());
-    let big_end = u128::from_le_bytes(txid_entry[16..].try_into().unwrap());
-    (little_end, big_end, self.index)
+    let mut writer = Vec::new();
+    ciborium::into_writer(&self, &mut writer).unwrap();
+    writer
   }
 }
 
-pub(super) type OutPointValue = [u8; 36];
+impl InscriptionId {
+  pub fn load_from_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+    Ok(ciborium::from_reader(bytes)?)
+  }
+}
+
+pub(super) type OutPointValue = Vec<u8>;
 
 impl Entry for OutPoint {
   type Value = OutPointValue;
 
-  fn load(value: Self::Value) -> Self {
-    Decodable::consensus_decode(&mut Cursor::new(value)).unwrap()
+  fn load(data: Self::Value) -> Self {
+    // Fixed size: txid (32 bytes) + vout (4 bytes) = 36 bytes
+    if data.len() != 36 {
+      panic!(
+        "Invalid OutPoint data length: expected 36 bytes, got {}",
+        data.len()
+      );
+    }
+    let txid_bytes: [u8; 32] = data[0..32].try_into().unwrap();
+    let vout_bytes: [u8; 4] = data[32..36].try_into().unwrap();
+    OutPoint {
+      txid: Txid::from_byte_array(txid_bytes),
+      vout: u32::from_be_bytes(vout_bytes),
+    }
   }
 
   fn store(self) -> Self::Value {
-    let mut value = [0; 36];
-    self.consensus_encode(&mut value.as_mut_slice()).unwrap();
-    value
+    // Fixed size: txid (32 bytes) + vout (4 bytes) = 36 bytes
+    let mut writer = Vec::with_capacity(36);
+    writer.extend_from_slice(&self.txid.to_byte_array());
+    writer.extend_from_slice(&self.vout.to_be_bytes());
+    writer
   }
 }
 
-pub(super) type SatPointValue = [u8; 44];
+pub(super) type SatPointValue = Vec<u8>;
 
 impl Entry for SatPoint {
   type Value = SatPointValue;
 
-  fn load(value: Self::Value) -> Self {
-    Decodable::consensus_decode(&mut Cursor::new(value)).unwrap()
+  fn load(data: Self::Value) -> Self {
+    ciborium::from_reader(&data[..]).unwrap()
   }
 
   fn store(self) -> Self::Value {
-    let mut value = [0; 44];
-    self.consensus_encode(&mut value.as_mut_slice()).unwrap();
-    value
+    let mut writer = Vec::new();
+    ciborium::into_writer(&self, &mut writer).unwrap();
+    writer
   }
 }
 
 pub(super) type SatRange = (u64, u64);
 
 impl Entry for SatRange {
-  type Value = [u8; 14];
+  type Value = Vec<u8>;
 
-  fn load([b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13]: Self::Value) -> Self {
-    let raw_base = u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, 0]);
-
-    // 55 bit base
-    let base = raw_base & ((1 << 55) - 1);
-
-    let raw_delta = u64::from_le_bytes([b6, b7, b8, b9, b10, b11, b12, b13]);
-
-    // 33 bit delta
-    let delta = raw_delta >> 7;
-
-    (base, base + delta)
+  fn load(data: Self::Value) -> Self {
+    ciborium::from_reader(&data[..]).unwrap()
   }
 
   fn store(self) -> Self::Value {
-    let base = self.0;
-    let delta = self.1 - self.0;
-    let n = u128::from(base) | u128::from(delta) << 55;
-    n.to_le_bytes()[0..14].try_into().unwrap()
+    let mut writer = Vec::new();
+    ciborium::into_writer(&self, &mut writer).unwrap();
+    writer
   }
 }
 
-pub(super) type TxidValue = [u8; 32];
+pub(super) type TxidValue = Vec<u8>;
 
 impl Entry for Txid {
   type Value = TxidValue;
 
-  fn load(value: Self::Value) -> Self {
-    Txid::from_byte_array(value)
+  fn load(data: Self::Value) -> Self {
+    ciborium::from_reader(&data[..]).unwrap()
   }
 
   fn store(self) -> Self::Value {
-    Txid::to_byte_array(self)
+    let mut writer = Vec::new();
+    ciborium::into_writer(&self, &mut writer).unwrap();
+    writer
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use bitcoin::{OutPoint, Txid};
+
+  #[test]
+  fn test_outpoint_store_size() {
+    // Test OutPoint serialization size
+    let txid_hex = "c7ee58a761f23d68b4a35c16f25e96fe9317a63d8a951eff9773099ba08cb6ad";
+    let txid = Txid::from_str(txid_hex).unwrap();
+
+    // Test different vout values
+    for vout in [0u32, 1, 255, 256, 65535, 65536, u32::MAX] {
+      let outpoint = OutPoint::new(txid, vout);
+      let serialized = outpoint.store();
+      println!("OutPoint with vout={}: {} bytes", vout, serialized.len());
+    }
+  }
 
   #[test]
   fn test_sat_range_load_store() {
@@ -519,10 +385,10 @@ mod tests {
       timestamp: 9,
     };
 
-    let value = (0, 1, 2, id.store(), 3, vec![4, 5, 6], Some(7), 8, 9);
-
-    assert_eq!(entry.clone().store(), value);
-    assert_eq!(InscriptionEntry::load(value), entry);
+    // Test serialization round-trip
+    let serialized = entry.clone().store();
+    let deserialized = InscriptionEntry::load(serialized);
+    assert_eq!(entry, deserialized);
   }
 
   #[test]
@@ -531,23 +397,10 @@ mod tests {
       .parse::<InscriptionId>()
       .unwrap();
 
-    assert_eq!(
-      inscription_id.store(),
-      (
-        0x0123456789abcdef0123456789abcdef,
-        0x0123456789abcdef0123456789abcdef,
-        0
-      )
-    );
-
-    assert_eq!(
-      InscriptionId::load((
-        0x0123456789abcdef0123456789abcdef,
-        0x0123456789abcdef0123456789abcdef,
-        0
-      )),
-      inscription_id
-    );
+    // Test serialization round-trip
+    let serialized = inscription_id.store();
+    let deserialized = InscriptionId::load(serialized);
+    assert_eq!(inscription_id, deserialized);
   }
 
   #[test]
@@ -556,17 +409,19 @@ mod tests {
       .parse::<InscriptionId>()
       .unwrap();
 
-    assert_eq!(inscription_id.store(), (0, 0, 1));
-
-    assert_eq!(InscriptionId::load((0, 0, 1)), inscription_id);
+    // Test serialization round-trip
+    let serialized = inscription_id.store();
+    let deserialized = InscriptionId::load(serialized);
+    assert_eq!(inscription_id, deserialized);
 
     let inscription_id = "0000000000000000000000000000000000000000000000000000000000000000i256"
       .parse::<InscriptionId>()
       .unwrap();
 
-    assert_eq!(inscription_id.store(), (0, 0, 256));
-
-    assert_eq!(InscriptionId::load((0, 0, 256)), inscription_id);
+    // Test serialization round-trip
+    let serialized = inscription_id.store();
+    let deserialized = InscriptionId::load(serialized);
+    assert_eq!(inscription_id, deserialized);
   }
 
   #[test]
@@ -598,48 +453,38 @@ mod tests {
       turbo: true,
     };
 
-    let value = (
-      12,
-      1,
-      3,
-      (
-        0x0F0E0D0C0B0A09080706050403020100,
-        0x1F1E1D1C1B1A19181716151413121110,
-      ),
-      11,
-      6,
-      12,
-      (7, 8),
-      Some('a'),
-      Some((Some(1), (Some(2), Some(3)), Some(4), (Some(5), Some(6)))),
-      10,
-      true,
-    );
-
-    assert_eq!(entry.store(), value);
-    assert_eq!(RuneEntry::load(value), entry);
+    // Test serialization round-trip
+    let serialized = entry.clone().store();
+    let deserialized = RuneEntry::load(serialized);
+    assert_eq!(entry, deserialized);
   }
 
   #[test]
   fn rune_id_entry() {
-    assert_eq!(RuneId { block: 1, tx: 2 }.store(), (1, 2),);
+    let rune_id = RuneId { block: 1, tx: 2 };
 
-    assert_eq!(RuneId { block: 1, tx: 2 }, RuneId::load((1, 2)),);
+    // Test serialization round-trip
+    let serialized = rune_id.store();
+    let deserialized = RuneId::load(serialized);
+    assert_eq!(rune_id, deserialized);
   }
 
   #[test]
   fn header() {
-    let expected = [
-      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-      26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
-      49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71,
-      72, 73, 74, 75, 76, 77, 78, 79,
-    ];
+    // Create a test header with some data
+    let mut header_data = [0u8; 80];
+    for i in 0..80 {
+      header_data[i] = i as u8;
+    }
 
-    let header = Header::load(expected);
-    let actual = header.store();
+    // Use consensus_decode to parse header
+    use bitcoin::consensus::Decodable;
+    let header = Header::consensus_decode(&mut &header_data[..]).unwrap();
 
-    assert_eq!(actual, expected);
+    // Test serialization round-trip
+    let serialized = header.store();
+    let deserialized = Header::load(serialized);
+    assert_eq!(header, deserialized);
   }
 
   #[test]
