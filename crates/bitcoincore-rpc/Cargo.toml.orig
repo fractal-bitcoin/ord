@@ -1,0 +1,33 @@
+[dependencies.bitcoin-private]
+version = "0.1.0"
+
+[dependencies.jsonrpc]
+version = "0.14.0"
+
+[dependencies.log]
+version = "0.4.5"
+
+[dependencies.ord-bitcoincore-rpc-json]
+version = "0.17.1"
+
+[dependencies.serde]
+version = "1"
+
+[dependencies.serde_json]
+version = "1"
+
+[lib]
+name = "bitcoincore_rpc"
+path = "src/lib.rs"
+
+[package]
+authors = ["Steven Roose <steven@stevenroose.org>", "Jean Pierre Dudey <jeandudey@hotmail.com>", "Dawid Ciężarkiewicz <dpc@dpc.pw>"]
+description = "RPC client library for the Bitcoin Core JSON-RPC API."
+edition = "2018"
+homepage = "https://github.com/rust-bitcoin/rust-bitcoincore-rpc/"
+keywords = ["crypto", "bitcoin", "bitcoin-core", "rpc"]
+license = "CC0-1.0"
+name = "ord-fractald-rpc"
+readme = "README.md"
+repository = "https://github.com/rust-bitcoin/rust-bitcoincore-rpc/"
+version = "0.17.2"

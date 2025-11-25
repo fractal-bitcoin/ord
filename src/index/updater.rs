@@ -1,7 +1,8 @@
 use {
   self::{inscription_updater::InscriptionUpdater, rune_updater::RuneUpdater},
-  super::{fetcher::Fetcher, *},
+  super::{fetcher::Fetcher, transaction_cache::TransactionCache, *},
   futures::future::try_join_all,
+  std::sync::MutexGuard,
   tokio::sync::{
     broadcast::{self, error::TryRecvError},
     mpsc::{self},
@@ -32,29 +33,38 @@ impl From<Block> for BlockData {
   }
 }
 
-pub(crate) struct Updater<'index> {
+pub(crate) struct Updater<'index, 'cache> {
   pub(super) height: u32,
   pub(super) index: &'index Index,
   pub(super) outputs_cached: u64,
+  pub(super) outputs_cached0: u64,
+  pub(super) outputs_cached1: u64,
+  pub(super) outputs_cached2: u64,
+  pub(super) outputs_cached3: u64,
+  pub(super) outputs_dust_count: u64,
+  pub(super) outputs_count: u64,
   pub(super) outputs_traversed: u64,
   pub(super) sat_ranges_since_flush: u64,
+  pub(super) cache: &'cache mut MutexGuard<'index, TransactionCache>,
 }
 
-impl<'index> Updater<'index> {
-  pub(crate) fn update_index(&mut self, mut wtx: WriteTransaction) -> Result {
+impl<'index, 'cache> Updater<'index, 'cache>
+where
+  'index: 'cache, // 显式声明
+{
+  pub(crate) fn update_index(&mut self) -> Result {
     let start = Instant::now();
     let starting_height = u32::try_from(self.index.client.get_block_count()?).unwrap() + 1;
     let starting_index_height = self.height;
 
-    wtx
-      .open_table(WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP)?
-      .insert(
-        &self.height,
-        &SystemTime::now()
-          .duration_since(SystemTime::UNIX_EPOCH)
-          .map(|duration| duration.as_millis())
-          .unwrap_or(0),
-      )?;
+    // 使用事务缓存添加写入事务时间戳
+    let timestamp = SystemTime::now()
+      .duration_since(SystemTime::UNIX_EPOCH)
+      .map(|duration| duration.as_millis())
+      .unwrap_or(0);
+    self
+      .cache
+      .add_write_transaction_timestamp(self.height, timestamp);
 
     let mut progress_bar = if cfg!(test)
       || log_enabled!(log::Level::Info)
@@ -81,7 +91,6 @@ impl<'index> Updater<'index> {
       self.index_block(
         &mut output_sender,
         &mut txout_receiver,
-        &mut wtx,
         block,
         &mut utxo_cache,
       )?;
@@ -100,47 +109,49 @@ impl<'index> Updater<'index> {
 
       uncommitted += 1;
 
+      let mut last_commit = false;
+      if SHUTTING_DOWN.load(atomic::Ordering::Relaxed) {
+        last_commit = true;
+      }
+
       if uncommitted == self.index.settings.commit_interval() {
-        self.commit(wtx, utxo_cache)?;
+        self.commit(utxo_cache, last_commit)?;
         utxo_cache = HashMap::new();
         uncommitted = 0;
-        wtx = self.index.begin_write()?;
-        let height = wtx
-          .open_table(HEIGHT_TO_BLOCK_HEADER)?
-          .range(0..)?
-          .next_back()
-          .transpose()?
-          .map(|(height, _hash)| height.value() + 1)
+        let height = self
+          .cache
+          .get_block_height(&self.index.database)?
+          .map(|h| h + 1)
           .unwrap_or(0);
         if height != self.height {
           // another update has run between committing and beginning the new
           // write transaction
           break;
         }
-        wtx
-          .open_table(WRITE_TRANSACTION_STARTING_BLOCK_COUNT_TO_TIMESTAMP)?
-          .insert(
-            &self.height,
-            &SystemTime::now()
-              .duration_since(SystemTime::UNIX_EPOCH)?
-              .as_millis(),
-          )?;
+        // 使用事务缓存添加写入事务时间戳
+        let timestamp = SystemTime::now()
+          .duration_since(SystemTime::UNIX_EPOCH)?
+          .as_millis();
+        self
+          .cache
+          .add_write_transaction_timestamp(self.height, timestamp);
       }
 
-      if SHUTTING_DOWN.load(atomic::Ordering::Relaxed) {
+      if last_commit {
         break;
       }
     }
 
     if starting_index_height == 0 && self.height > 0 {
-      wtx.open_table(STATISTIC_TO_COUNT)?.insert(
-        Statistic::InitialSyncTime.key(),
-        &u64::try_from(start.elapsed().as_micros())?,
-      )?;
+      // 使用事务缓存更新统计信息
+      self.cache.update_statistic(
+        Statistic::InitialSyncTime,
+        u64::try_from(start.elapsed().as_micros())?,
+      );
     }
 
     if uncommitted > 0 {
-      self.commit(wtx, utxo_cache)?;
+      self.commit(utxo_cache, true)?;
     }
 
     if let Some(progress_bar) = &mut progress_bar {
@@ -151,6 +162,112 @@ impl<'index> Updater<'index> {
   }
 
   fn fetch_blocks_from(
+    index: &Index,
+    height: u32,
+    index_sats: bool,
+  ) -> Result<std::sync::mpsc::Receiver<BlockData>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(32);
+
+    let first_inscription_height = index.first_inscription_height;
+
+    let height_limit = index.height_limit;
+    let height_fetch = Arc::new(atomic::AtomicU32::new(height));
+    let height_send = Arc::new(atomic::AtomicU32::new(height));
+    let should_exit = Arc::new(atomic::AtomicBool::new(false));
+
+    let settings = index.settings.clone();
+
+    thread::spawn(move || {
+      let worker_count = 4;
+      for _ in 0..worker_count {
+        if SHUTTING_DOWN.load(atomic::Ordering::Relaxed)
+          || should_exit.load(atomic::Ordering::Relaxed)
+        {
+          log::debug!("Block receiver shutting down");
+          break;
+        }
+
+        let height_fetch = Arc::clone(&height_fetch);
+        let height_send = Arc::clone(&height_send);
+        let should_exit = Arc::clone(&should_exit);
+        let tx = tx.clone();
+        let settings = settings.clone();
+
+        let client = match settings.bitcoin_rpc_client(None) {
+          Ok(client) => client,
+          Err(err) => {
+            log::error!(
+              "updater.fetch_blocks_from get client error: {}",
+              err.to_string()
+            );
+            return;
+          }
+        };
+
+        thread::spawn(move || loop {
+          if SHUTTING_DOWN.load(atomic::Ordering::Relaxed)
+            || should_exit.load(atomic::Ordering::Relaxed)
+          {
+            log::debug!("Block receiver shutting down");
+            break;
+          }
+
+          let height = height_fetch.fetch_add(1, atomic::Ordering::SeqCst);
+
+          if let Some(height_limit) = height_limit {
+            if height >= height_limit {
+              break;
+            }
+          }
+
+          match Self::get_block_with_retries(&client, height, index_sats, first_inscription_height)
+          {
+            Ok(Some(block)) => loop {
+              if SHUTTING_DOWN.load(atomic::Ordering::Relaxed) {
+                log::debug!("Block receiver shutting down");
+                return;
+              }
+
+              if height_send.load(atomic::Ordering::SeqCst) < height {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+              }
+
+              if let Err(err) = tx.send(block.into()) {
+                log::info!("Block receiver disconnected: {err}");
+              }
+              height_send.fetch_add(1, atomic::Ordering::SeqCst);
+              log::info!("Block sent: {height}");
+              break;
+            },
+            Ok(None) => {
+              if height_send.load(atomic::Ordering::SeqCst) == height {
+                log::debug!(
+                  "Failed to fetch block at expected height {height}, exiting all worker threads"
+                );
+                should_exit.store(true, atomic::Ordering::Relaxed);
+              }
+              break;
+            }
+            Err(err) => {
+              log::error!("failed to fetch block {height}: {err}");
+              if height_send.load(atomic::Ordering::SeqCst) == height {
+                log::error!(
+                  "Failed to fetch block at expected height {height}, exiting all worker threads"
+                );
+                should_exit.store(true, atomic::Ordering::Relaxed);
+              }
+              break;
+            }
+          }
+        });
+      }
+    });
+
+    Ok(rx)
+  }
+
+  fn fetch_blocks_from_x(
     index: &Index,
     mut height: u32,
     index_sats: bool,
@@ -312,10 +429,10 @@ impl<'index> Updater<'index> {
     &mut self,
     output_sender: &mut mpsc::Sender<OutPoint>,
     txout_receiver: &mut broadcast::Receiver<TxOut>,
-    wtx: &mut WriteTransaction,
     block: BlockData,
     utxo_cache: &mut HashMap<OutPoint, UtxoEntryBuf>,
   ) -> Result<()> {
+    log::info!("index_block enter, height: {:?}", self.height);
     Reorg::detect_reorg(&block, self.height, self.index)?;
 
     let start = Instant::now();
@@ -329,55 +446,35 @@ impl<'index> Updater<'index> {
       block.txdata.len()
     );
 
-    let mut height_to_block_header = wtx.open_table(HEIGHT_TO_BLOCK_HEADER)?;
-    let mut inscription_id_to_sequence_number =
-      wtx.open_table(INSCRIPTION_ID_TO_SEQUENCE_NUMBER)?;
-    let mut statistic_to_count = wtx.open_table(STATISTIC_TO_COUNT)?;
-
     if self.index.index_inscriptions || self.index.index_addresses || self.index.index_sats {
       self.index_utxo_entries(
         &block,
         txout_receiver,
         output_sender,
         utxo_cache,
-        wtx,
-        &mut inscription_id_to_sequence_number,
-        &mut statistic_to_count,
         &mut sat_ranges_written,
         &mut outputs_in_block,
       )?;
     }
 
     if self.index.index_runes && self.height >= self.index.settings.first_rune_height() {
-      let mut outpoint_to_rune_balances = wtx.open_table(OUTPOINT_TO_RUNE_BALANCES)?;
-      let mut rune_id_to_rune_entry = wtx.open_table(RUNE_ID_TO_RUNE_ENTRY)?;
-      let mut rune_to_rune_id = wtx.open_table(RUNE_TO_RUNE_ID)?;
-      let mut sequence_number_to_rune_id = wtx.open_table(SEQUENCE_NUMBER_TO_RUNE_ID)?;
-      let mut transaction_id_to_rune = wtx.open_table(TRANSACTION_ID_TO_RUNE)?;
-
-      let runes = statistic_to_count
-        .get(&Statistic::Runes.into())?
-        .map(|x| x.value())
-        .unwrap_or(0);
+      let runes = self
+        .cache
+        .get_statistic(&self.index.database, Statistic::Runes)?;
 
       let mut rune_updater = RuneUpdater {
         event_sender: self.index.event_sender.as_ref(),
         block_time: block.header.time,
         burned: HashMap::new(),
+        cache: &mut self.cache,
         client: &self.index.client,
         height: self.height,
-        id_to_entry: &mut rune_id_to_rune_entry,
-        inscription_id_to_sequence_number: &mut inscription_id_to_sequence_number,
         minimum: Rune::minimum_at_height(
           self.index.settings.chain().network(),
           Height(self.height),
         ),
-        outpoint_to_balances: &mut outpoint_to_rune_balances,
-        rune_to_id: &mut rune_to_rune_id,
         runes,
-        sequence_number_to_rune_id: &mut sequence_number_to_rune_id,
-        statistic_to_count: &mut statistic_to_count,
-        transaction_id_to_rune: &mut transaction_id_to_rune,
+        database: &self.index.database,
       };
 
       for (i, (tx, txid)) in block.txdata.iter().enumerate() {
@@ -387,7 +484,27 @@ impl<'index> Updater<'index> {
       rune_updater.update()?;
     }
 
-    height_to_block_header.insert(&self.height, &block.header.store())?;
+    // 使用事务缓存添加区块头
+    self.cache.add_block_header(self.height, block.header);
+
+    // Light flush for critical column families after each block
+    if self.height % 100 == 0 {
+      // Flush every 100 blocks to balance performance and persistence
+      let light_flush_opts = {
+        let mut opts = FlushOptions::default();
+        opts.set_wait(false); // Don't wait for flush to complete
+        opts
+      };
+
+      let critical_cfs = [CF_HEIGHT_TO_BLOCK_HEADER, CF_STATISTIC_TO_COUNT];
+      for cf_name in &critical_cfs {
+        if let Some(cf) = self.index.database.cf_handle(cf_name) {
+          if let Err(e) = self.index.database.flush_cf_opt(&cf, &light_flush_opts) {
+            log::debug!("Light flush failed for {}: {}", cf_name, e);
+          }
+        }
+      }
+    }
 
     self.height += 1;
     self.outputs_traversed += outputs_in_block;
@@ -400,31 +517,15 @@ impl<'index> Updater<'index> {
     Ok(())
   }
 
-  fn index_utxo_entries<'wtx>(
+  fn index_utxo_entries(
     &mut self,
     block: &BlockData,
     txout_receiver: &mut broadcast::Receiver<TxOut>,
     output_sender: &mut mpsc::Sender<OutPoint>,
     utxo_cache: &mut HashMap<OutPoint, UtxoEntryBuf>,
-    wtx: &'wtx WriteTransaction,
-    inscription_id_to_sequence_number: &mut Table<'wtx, (u128, u128, u32), u64>,
-    statistic_to_count: &mut Table<'wtx, u64, u64>,
     sat_ranges_written: &mut u64,
     outputs_in_block: &mut u64,
   ) -> Result<(), Error> {
-    let mut height_to_last_sequence_number = wtx.open_table(HEIGHT_TO_LAST_SEQUENCE_NUMBER)?;
-    let mut home_inscriptions = wtx.open_table(HOME_INSCRIPTIONS)?;
-    let mut inscription_number_to_sequence_number =
-      wtx.open_table(INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER)?;
-    let mut outpoint_to_utxo_entry = wtx.open_table(OUTPOINT_TO_UTXO_ENTRY)?;
-    let mut sat_to_satpoint = wtx.open_table(SAT_TO_SATPOINT)?;
-    let mut sat_to_sequence_number = wtx.open_multimap_table(SAT_TO_SEQUENCE_NUMBER)?;
-    let mut script_pubkey_to_outpoint = wtx.open_multimap_table(SCRIPT_PUBKEY_TO_OUTPOINT)?;
-    let mut sequence_number_to_children = wtx.open_multimap_table(SEQUENCE_NUMBER_TO_CHILDREN)?;
-    let mut sequence_number_to_inscription_entry =
-      wtx.open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)?;
-    let mut transaction_id_to_transaction = wtx.open_table(TRANSACTION_ID_TO_TRANSACTION)?;
-
     let index_inscriptions =
       self.height >= self.index.first_inscription_height && self.index.index_inscriptions;
 
@@ -461,8 +562,24 @@ impl<'index> Updater<'index> {
           if utxo_cache.contains_key(&prev_output) {
             continue;
           }
-          // We don't need inputs we already have in our database
-          if outpoint_to_utxo_entry.get(&prev_output.store())?.is_some() {
+          // We don't need inputs we already have in our cache from earlier commit
+          if self.cache.long_utxo_cache.contains_key(&prev_output) {
+            continue;
+          }
+          // We don't need inputs we already have in our nondust database
+          if self
+            .cache
+            .get_nondust_utxo_entry(&self.index.database, &prev_output)?
+            .is_some()
+          {
+            continue;
+          }
+          // We don't need inputs we already have in our dust database
+          if self
+            .cache
+            .get_utxo_entry(&self.index.database, &prev_output)?
+            .is_some()
+          {
             continue;
           }
           // Send this outpoint to background thread to be fetched
@@ -471,34 +588,28 @@ impl<'index> Updater<'index> {
       }
     }
 
-    let mut lost_sats = statistic_to_count
-      .get(&Statistic::LostSats.key())?
-      .map(|lost_sats| lost_sats.value())
-      .unwrap_or(0);
+    // 使用事务缓存获取统计信息（读穿透）
+    let mut lost_sats = self
+      .cache
+      .get_statistic(&self.index.database, Statistic::LostSats)?;
+    let cursed_inscription_count = self
+      .cache
+      .get_statistic(&self.index.database, Statistic::CursedInscriptions)?;
+    let blessed_inscription_count = self
+      .cache
+      .get_statistic(&self.index.database, Statistic::BlessedInscriptions)?;
+    let unbound_inscriptions = self
+      .cache
+      .get_statistic(&self.index.database, Statistic::UnboundInscriptions)?;
 
-    let cursed_inscription_count = statistic_to_count
-      .get(&Statistic::CursedInscriptions.key())?
-      .map(|count| count.value())
-      .unwrap_or(0);
+    // 使用缓存获取下一个序列号
+    let next_sequence_number = self.cache.get_next_sequence_number();
 
-    let blessed_inscription_count = statistic_to_count
-      .get(&Statistic::BlessedInscriptions.key())?
-      .map(|count| count.value())
-      .unwrap_or(0);
-
-    let unbound_inscriptions = statistic_to_count
-      .get(&Statistic::UnboundInscriptions.key())?
-      .map(|unbound_inscriptions| unbound_inscriptions.value())
-      .unwrap_or(0);
-
-    let next_sequence_number = sequence_number_to_inscription_entry
-      .iter()?
-      .next_back()
-      .transpose()?
-      .map(|(number, _id)| number.value() + 1)
-      .unwrap_or(0);
-
-    let home_inscription_count = home_inscriptions.len()?;
+    // // 使用缓存获取home inscription计数
+    let home_inscription_count = 0;
+    // let home_inscription_count = self
+    //   .cache
+    //   .get_home_inscription_count(&self.index.database)?;
 
     let mut inscription_updater = InscriptionUpdater {
       blessed_inscription_count,
@@ -506,19 +617,13 @@ impl<'index> Updater<'index> {
       flotsam: Vec::new(),
       height: self.height,
       home_inscription_count,
-      home_inscriptions: &mut home_inscriptions,
-      id_to_sequence_number: inscription_id_to_sequence_number,
-      inscription_number_to_sequence_number: &mut inscription_number_to_sequence_number,
       lost_sats,
       next_sequence_number,
       reward: Height(self.height).subsidy(),
-      sat_to_sequence_number: &mut sat_to_sequence_number,
-      sequence_number_to_children: &mut sequence_number_to_children,
-      sequence_number_to_entry: &mut sequence_number_to_inscription_entry,
       timestamp: block.header.time,
       transaction_buffer: Vec::new(),
-      transaction_id_to_transaction: &mut transaction_id_to_transaction,
       unbound_inscriptions,
+      database: &self.index.database,
     };
 
     let mut coinbase_inputs = VecDeque::new();
@@ -541,6 +646,7 @@ impl<'index> Updater<'index> {
     {
       log::trace!("Indexing transaction {tx_offset}…");
 
+      // 处理输入UTXO条目
       let input_utxo_entries = if tx_offset == 0 {
         Vec::new()
       } else {
@@ -549,18 +655,59 @@ impl<'index> Updater<'index> {
           .map(|input| {
             let outpoint = input.previous_output.store();
 
-            let entry = if let Some(entry) = utxo_cache.remove(&OutPoint::load(outpoint)) {
+            self.outputs_count += 1;
+            let entry = if let Some(entry) = utxo_cache.remove(&OutPoint::load(outpoint.clone())) {
               self.outputs_cached += 1;
+              self.outputs_cached0 += 1;
               entry
-            } else if let Some(entry) = outpoint_to_utxo_entry.remove(&outpoint)? {
+            } else if let Some(entry) = self
+              .cache
+              .long_utxo_cache
+              .remove(&OutPoint::load(outpoint.clone()))
+            {
+              self.outputs_cached += 1;
+              self.outputs_cached1 += 1;
+              entry
+            } else if let Some(entry) = self
+              .cache
+              .get_nondust_utxo_entry(&self.index.database, &OutPoint::load(outpoint.clone()))?
+            {
+              self.outputs_cached2 += 1;
+              // 从数据库中获取UTXO，并标记为待删除
+              self
+                .cache
+                .mark_nondust_utxo_for_deletion(OutPoint::load(outpoint.clone()));
+
               if self.index.index_addresses {
-                let script_pubkey = entry.value().parse(self.index).script_pubkey();
-                if !script_pubkey_to_outpoint.remove(script_pubkey, outpoint)? {
-                  panic!("script pubkey entry ({script_pubkey:?}, {outpoint:?}) not found");
-                }
+                // 处理地址索引删除
+                let script_pubkey = entry.parse(self.index).script_pubkey();
+                self.cache.mark_address_index_for_deletion(
+                  script_pubkey.to_vec(),
+                  OutPoint::load(outpoint.clone()),
+                );
               }
 
-              entry.value().to_buf()
+              entry
+            } else if let Some(entry) = self
+              .cache
+              .get_utxo_entry(&self.index.database, &OutPoint::load(outpoint.clone()))?
+            {
+              self.outputs_cached3 += 1;
+              // 从数据库中获取UTXO，并标记为待删除
+              self
+                .cache
+                .mark_utxo_for_deletion(OutPoint::load(outpoint.clone()));
+
+              if self.index.index_addresses {
+                // 处理地址索引删除
+                let script_pubkey = entry.parse(self.index).script_pubkey();
+                self.cache.mark_address_index_for_deletion(
+                  script_pubkey.to_vec(),
+                  OutPoint::load(outpoint.clone()),
+                );
+              }
+
+              entry
             } else {
               assert!(!self.index.index_sats);
               let txout = txout_receiver.blocking_recv().map_err(|err| {
@@ -618,7 +765,6 @@ impl<'index> Updater<'index> {
         self.index_transaction_sats(
           tx,
           *txid,
-          &mut sat_to_satpoint,
           &mut output_utxo_entries,
           &mut input_sat_ranges,
           sat_ranges_written,
@@ -637,14 +783,14 @@ impl<'index> Updater<'index> {
             let mut lost_sat_ranges = Vec::new();
             for (start, end) in input_sat_ranges {
               if !Sat(start).common() {
-                sat_to_satpoint.insert(
-                  &start,
-                  &SatPoint {
+                // 使用事务缓存机制处理lost sats的sat到satpoint映射
+                self.cache.add_sat_satpoint_mapping(
+                  start,
+                  SatPoint {
                     outpoint: OutPoint::null(),
                     offset: lost_sats,
-                  }
-                  .store(),
-                )?;
+                  },
+                );
               }
 
               lost_sat_ranges.extend_from_slice(&(start, end).store());
@@ -681,6 +827,7 @@ impl<'index> Updater<'index> {
           utxo_cache,
           self.index,
           orig_input_sat_ranges.as_ref(),
+          &mut self.cache,
         )?;
       }
 
@@ -691,33 +838,33 @@ impl<'index> Updater<'index> {
     }
 
     if index_inscriptions {
-      height_to_last_sequence_number
-        .insert(&self.height, inscription_updater.next_sequence_number)?;
+      // 使用事务缓存机制处理高度到最后一个序列号的映射
+      self
+        .cache
+        .set_height_to_last_sequence_number(self.height, inscription_updater.next_sequence_number);
     }
 
-    statistic_to_count.insert(
-      &Statistic::LostSats.key(),
-      &if self.index.index_sats {
+    // 更新缓存中的统计信息
+    self.cache.update_statistic(
+      Statistic::LostSats,
+      if self.index.index_sats {
         lost_sats
       } else {
         inscription_updater.lost_sats
       },
-    )?;
-
-    statistic_to_count.insert(
-      &Statistic::CursedInscriptions.key(),
-      &inscription_updater.cursed_inscription_count,
-    )?;
-
-    statistic_to_count.insert(
-      &Statistic::BlessedInscriptions.key(),
-      &inscription_updater.blessed_inscription_count,
-    )?;
-
-    statistic_to_count.insert(
-      &Statistic::UnboundInscriptions.key(),
-      &inscription_updater.unbound_inscriptions,
-    )?;
+    );
+    self.cache.update_statistic(
+      Statistic::CursedInscriptions,
+      inscription_updater.cursed_inscription_count,
+    );
+    self.cache.update_statistic(
+      Statistic::BlessedInscriptions,
+      inscription_updater.blessed_inscription_count,
+    );
+    self.cache.update_statistic(
+      Statistic::UnboundInscriptions,
+      inscription_updater.unbound_inscriptions,
+    );
 
     Ok(())
   }
@@ -736,7 +883,6 @@ impl<'index> Updater<'index> {
     &mut self,
     tx: &Transaction,
     txid: Txid,
-    sat_to_satpoint: &mut Table<u64, &SatPointValue>,
     output_utxo_entries: &mut [UtxoEntryBuf],
     input_sat_ranges: &mut VecDeque<(u64, u64)>,
     sat_ranges_written: &mut u64,
@@ -756,14 +902,14 @@ impl<'index> Updater<'index> {
           .ok_or_else(|| anyhow!("insufficient inputs for transaction outputs"))?;
 
         if !Sat(range.0).common() {
-          sat_to_satpoint.insert(
-            &range.0,
-            &SatPoint {
+          // 使用事务缓存机制处理sat到satpoint的映射
+          self.cache.add_sat_satpoint_mapping(
+            range.0,
+            SatPoint {
               outpoint,
               offset: output.value - remaining,
-            }
-            .store(),
-          )?;
+            },
+          );
         }
 
         let count = range.1 - range.0;
@@ -792,60 +938,134 @@ impl<'index> Updater<'index> {
     Ok(())
   }
 
-  fn commit(
-    &mut self,
-    wtx: WriteTransaction,
-    utxo_cache: HashMap<OutPoint, UtxoEntryBuf>,
-  ) -> Result {
+  fn commit(&mut self, utxo_cache: HashMap<OutPoint, UtxoEntryBuf>, last_commit: bool) -> Result {
     log::info!(
-      "Committing at block height {}, {} outputs traversed, {} in map, {} cached",
+      "Committing at block height {}, {} outputs traversed, {} in map, {} cached, {} cache0, {} cache1, {} cache2, {} cache3, {} rpc, {} all outputs",
       self.height,
       self.outputs_traversed,
       utxo_cache.len(),
-      self.outputs_cached
+      self.outputs_cached,
+      self.outputs_cached0,
+      self.outputs_cached1,
+      self.outputs_cached2,
+      self.outputs_cached3,
+      self.outputs_count-self.outputs_cached0-self.outputs_cached1-self.outputs_cached2-self.outputs_cached3,
+      self.outputs_count,
     );
 
-    {
-      let mut outpoint_to_utxo_entry = wtx.open_table(OUTPOINT_TO_UTXO_ENTRY)?;
-      let mut script_pubkey_to_outpoint = wtx.open_multimap_table(SCRIPT_PUBKEY_TO_OUTPOINT)?;
-      let mut sequence_number_to_satpoint = wtx.open_table(SEQUENCE_NUMBER_TO_SATPOINT)?;
+    // 更新统计信息到缓存
+    self
+      .cache
+      .update_statistic(Statistic::OutputsTraversed, self.outputs_traversed);
+    self
+      .cache
+      .update_statistic(Statistic::SatRanges, self.sat_ranges_since_flush);
+    self.cache.update_statistic(Statistic::Commits, 1);
 
-      for (outpoint, mut utxo_entry) in utxo_cache {
-        if Index::is_special_outpoint(outpoint) {
-          if let Some(old_entry) = outpoint_to_utxo_entry.get(&outpoint.store())? {
-            utxo_entry = UtxoEntryBuf::merged(old_entry.value(), &utxo_entry, self.index);
-          }
+    // 准备地址索引和铭文索引数据
+    let mut address_index_data = Vec::new();
+    let mut inscription_index_data = Vec::new();
+
+    // 处理UTXO数据并收集索引数据
+    for (outpoint, mut utxo_entry) in utxo_cache {
+      if Index::is_special_outpoint(outpoint) {
+        if let Some(old_entry) = self.cache.get_utxo_entry(&self.index.database, &outpoint)? {
+          utxo_entry = old_entry;
         }
+      }
 
-        outpoint_to_utxo_entry.insert(&outpoint.store(), utxo_entry.as_ref())?;
+      // 将UTXO数据添加到缓存
+      self.cache.add_utxo_entry(outpoint, utxo_entry.clone());
 
-        let utxo_entry = utxo_entry.parse(self.index);
-        if self.index.index_addresses {
-          let script_pubkey = utxo_entry.script_pubkey();
-          script_pubkey_to_outpoint.insert(script_pubkey, &outpoint.store())?;
-        }
+      // 解析UTXO条目以获取索引数据
+      let parsed_utxo_entry = utxo_entry.parse(self.index);
 
-        if self.index.index_inscriptions {
-          for (sequence_number, offset) in utxo_entry.parse_inscriptions() {
-            let satpoint = SatPoint { outpoint, offset };
-            sequence_number_to_satpoint.insert(sequence_number, &satpoint.store())?;
-          }
+      // 收集地址索引数据
+      if self.index.index_addresses {
+        let script_pubkey = parsed_utxo_entry.script_pubkey();
+        address_index_data.push((script_pubkey.to_vec(), outpoint));
+      }
+
+      // 收集铭文索引数据
+      if self.index.index_inscriptions {
+        for (sequence_number, offset) in parsed_utxo_entry.parse_inscriptions() {
+          let satpoint = SatPoint { outpoint, offset };
+          inscription_index_data.push((sequence_number, satpoint));
         }
       }
     }
 
-    Index::increment_statistic(&wtx, Statistic::OutputsTraversed, self.outputs_traversed)?;
+    // 统一提交所有操作（包括UTXO数据、缓存数据和索引数据）
+    self.cache.commit_with_extra_data(
+      &self.index.database,
+      &self.index.write_options,
+      &address_index_data,
+      &inscription_index_data,
+      last_commit,
+    )?;
+
+    // 重置计数器
     self.outputs_traversed = 0;
-    Index::increment_statistic(&wtx, Statistic::SatRanges, self.sat_ranges_since_flush)?;
     self.sat_ranges_since_flush = 0;
-    Index::increment_statistic(&wtx, Statistic::Commits, 1)?;
-    wtx.commit()?;
+    self.outputs_cached = 0;
+    self.outputs_cached0 = 0;
+    self.outputs_cached1 = 0;
+    self.outputs_cached2 = 0;
+    self.outputs_cached3 = 0;
+    self.outputs_dust_count = 0;
+    self.outputs_count = 0;
 
-    // Commit twice since due to a bug redb will only reuse pages freed in the
-    // transaction before last.
-    self.index.begin_write()?.commit()?;
+    // For RocksDB, manually flush all column families to ensure data persistence
+    // This simulates the commit behavior of redb transactions
+    let flush_opts = {
+      let mut opts = FlushOptions::default();
+      opts.set_wait(true); // Wait for flush to complete
+      opts
+    };
 
-    Reorg::update_savepoints(self.index, self.height)?;
+    // Flush all relevant column families
+    let cf_names = [
+      CF_OUTPOINT_TO_UTXO_ENTRY,
+      CF_OUTPOINT_TO_NONDUST_UTXO_ENTRY,
+      CF_SCRIPT_PUBKEY_TO_OUTPOINT,
+      CF_SEQUENCE_NUMBER_TO_SATPOINT,
+      CF_HEIGHT_TO_BLOCK_HEADER,
+      CF_INSCRIPTION_ID_TO_SEQUENCE_NUMBER,
+      CF_STATISTIC_TO_COUNT,
+      CF_HEIGHT_TO_LAST_SEQUENCE_NUMBER,
+    ];
+
+    log::debug!(
+      "Flushing {} column families to ensure data persistence",
+      cf_names.len()
+    );
+
+    let mut flush_errors = Vec::new();
+    for cf_name in &cf_names {
+      if let Some(cf) = self.index.database.cf_handle(cf_name) {
+        if let Err(e) = self.index.database.flush_cf_opt(&cf, &flush_opts) {
+          let error_msg = format!("Failed to flush column family {}: {}", cf_name, e);
+          log::warn!("{}", error_msg);
+          flush_errors.push(error_msg);
+        }
+      } else {
+        log::warn!("Column family {} not found", cf_name);
+      }
+    }
+
+    if !flush_errors.is_empty() {
+      log::warn!("Some column families failed to flush: {:?}", flush_errors);
+    } else {
+      log::debug!("All column families flushed successfully");
+    }
+
+    if let Err(e) = self.index.database.flush() {
+      log::warn!("Failed to flush: {}", e);
+    }
+    log::debug!("Flushing db to ensure all data persistence",);
+
+    // 当前数据高度为 self.height - 1
+    Reorg::update_savepoints(self.index, self.height - 1)?;
 
     Ok(())
   }

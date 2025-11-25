@@ -1,17 +1,8 @@
-#[macro_export]
-macro_rules! define_table {
-  ($name:ident, $key:ty, $value:ty) => {
-    const $name: TableDefinition<$key, $value> = TableDefinition::new(stringify!($name));
-  };
-}
+// This macro has been removed for RocksDB compatibility
+// RocksDB doesn't use table definitions like redb
 
-#[macro_export]
-macro_rules! define_multimap_table {
-  ($name:ident, $key:ty, $value:ty) => {
-    const $name: MultimapTableDefinition<$key, $value> =
-      MultimapTableDefinition::new(stringify!($name));
-  };
-}
+// This macro has been removed for RocksDB compatibility
+// RocksDB doesn't use multimap table definitions like redb
 
 #[macro_export]
 macro_rules! tprintln {
