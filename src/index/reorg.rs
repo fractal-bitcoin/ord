@@ -1,3 +1,6 @@
+use rocksdb::checkpoint::Checkpoint;
+use std::fs;
+use std::path::Path;
 use {super::*, updater::BlockData};
 
 #[derive(Debug, PartialEq)]
@@ -19,31 +22,36 @@ impl Display for Error {
 
 impl std::error::Error for Error {}
 
-const MAX_SAVEPOINTS: u32 = 2;
-const SAVEPOINT_INTERVAL: u32 = 10;
-const CHAIN_TIP_DISTANCE: u32 = 21;
+const MAX_SAVEPOINTS: u64 = 2;
+const SAVEPOINT_INTERVAL: u64 = 10;
+const CHAIN_TIP_DISTANCE: u64 = 21;
 
 pub(crate) struct Reorg {}
 
 impl Reorg {
   pub(crate) fn detect_reorg(block: &BlockData, height: u32, index: &Index) -> Result {
+    log::info!("detect_reorg enter, height: {:?}", height);
     let bitcoind_prev_blockhash = block.header.prev_blockhash;
 
     match index.block_hash(height.checked_sub(1))? {
       Some(index_prev_blockhash) if index_prev_blockhash == bitcoind_prev_blockhash => Ok(()),
       Some(index_prev_blockhash) if index_prev_blockhash != bitcoind_prev_blockhash => {
         let max_recoverable_reorg_depth =
-          (MAX_SAVEPOINTS - 1) * SAVEPOINT_INTERVAL + height % SAVEPOINT_INTERVAL;
+          (MAX_SAVEPOINTS - 1) * SAVEPOINT_INTERVAL + (height % SAVEPOINT_INTERVAL as u32) as u64;
 
-        for depth in 1..max_recoverable_reorg_depth {
-          let index_block_hash = index.block_hash(height.checked_sub(depth))?;
+        for depth in 1..=max_recoverable_reorg_depth as u32 {
+          let depth_u32 = depth;
+          let index_block_hash = index.block_hash(height.checked_sub(depth_u32))?;
           let bitcoind_block_hash = index
             .client
-            .get_block_hash(u64::from(height.saturating_sub(depth)))
+            .get_block_hash(u64::from(height.saturating_sub(depth_u32)))
             .into_option()?;
 
           if index_block_hash == bitcoind_block_hash {
-            return Err(anyhow!(reorg::Error::Recoverable { height, depth }));
+            return Err(anyhow!(reorg::Error::Recoverable {
+              height,
+              depth: depth_u32
+            }));
           }
         }
 
@@ -53,66 +61,205 @@ impl Reorg {
     }
   }
 
+  pub(crate) fn is_savepoint_required(index: &Index, height: u32) -> Result<bool> {
+    let height = u64::from(height);
+
+    let statistic_to_count = index
+      .database
+      .cf_handle(CF_STATISTIC_TO_COUNT)
+      .ok_or_else(|| anyhow!("Failed to open column family 'statistic_to_count'"))?;
+
+    let last_savepoint_height = index
+      .database
+      .get_cf(
+        statistic_to_count,
+        &Statistic::LastSavepointHeight.key().to_be_bytes(),
+      )?
+      .map(|last_savepoint_height| {
+        u64::from(u32::from_be_bytes(
+          last_savepoint_height.try_into().unwrap(),
+        ))
+      })
+      .unwrap_or(0);
+
+    let blocks = index.client.get_blockchain_info()?.headers;
+
+    let result = (height < SAVEPOINT_INTERVAL
+      || height.saturating_sub(last_savepoint_height) >= SAVEPOINT_INTERVAL)
+      && blocks.saturating_sub(height) <= CHAIN_TIP_DISTANCE;
+
+    log::trace!(
+      "is_savepoint_required={}: height={}, last_savepoint_height={}, blocks={}",
+      result,
+      height,
+      last_savepoint_height,
+      blocks
+    );
+
+    Ok(result)
+  }
+
   pub(crate) fn handle_reorg(index: &Index, height: u32, depth: u32) -> Result {
     log::info!("rolling back database after reorg of depth {depth} at height {height}");
 
-    if let redb::Durability::None = index.durability {
-      panic!("set index durability to `Durability::Immediate` to test reorg handling");
+    // 将checkpoint目录放在与index.rocksdb同级目录
+    let checkpoints_dir = index
+      .path
+      .parent()
+      .ok_or_else(|| anyhow!("Cannot get parent directory of index path"))?
+      .join("checkpoints");
+    if !checkpoints_dir.exists() {
+      return Err(anyhow!("No checkpoints found"));
     }
 
-    let mut wtx = index.begin_write()?;
+    // 获取所有checkpoint目录，按高度排序
+    let mut checkpoint_dirs: Vec<_> = fs::read_dir(&checkpoints_dir)?
+      .filter_map(|entry| {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        if path.is_dir() {
+          let name = path.file_name()?.to_str()?;
+          if name.starts_with("checkpoint_") {
+            let height_str = &name[11..]; // 跳过 "checkpoint_" 前缀
+            height_str.parse::<u32>().ok().map(|height| (height, path))
+          } else {
+            None
+          }
+        } else {
+          None
+        }
+      })
+      .collect();
 
-    let oldest_savepoint =
-      wtx.get_persistent_savepoint(wtx.list_persistent_savepoints()?.min().unwrap())?;
+    checkpoint_dirs.sort_by_key(|(height, _)| *height);
 
-    wtx.restore_savepoint(&oldest_savepoint)?;
+    // 找到最合适的checkpoint（高度小于当前高度的最大checkpoint）
+    let target_checkpoint = checkpoint_dirs
+      .iter()
+      .rev()
+      .find(|(checkpoint_height, _)| *checkpoint_height <= height - depth)
+      .ok_or_else(|| anyhow!("No suitable checkpoint found for rollback"))?;
 
-    Index::increment_statistic(&wtx, Statistic::Commits, 1)?;
-    wtx.commit()?;
+    let (checkpoint_height, checkpoint_path) = target_checkpoint;
+    log::info!(
+      "restoring checkpoint at height {}, path: {}",
+      checkpoint_height,
+      checkpoint_path.display()
+    );
+
+    let db_dir = index.path.clone();
+    let temp_dir = index
+      .path
+      .parent()
+      .ok_or_else(|| anyhow!("Cannot get parent directory of index path"))?
+      .join("backup");
+
+    if db_dir.exists() {
+      if temp_dir.exists() {
+        fs::remove_dir_all(&temp_dir)?;
+      }
+      // 将当前数据库移动到临时位置
+      fs::rename(&db_dir, &temp_dir)?;
+    }
+
+    // 将checkpoint重命名为数据库目录（原子操作）
+    fs::rename(checkpoint_path, &db_dir)?;
+
+    // 删除当前高度之后的checkpoint
+    for (_height, path) in checkpoint_dirs
+      .iter()
+      .skip_while(|(h, _)| *h <= height - depth)
+    {
+      log::info!("removing checkpoint path: {}", path.display());
+      fs::remove_dir_all(path)?;
+    }
 
     log::info!(
-      "successfully rolled back database to height {}",
-      index.begin_read()?.block_count()?
+      "successfully prepared database rollback to height {}",
+      checkpoint_height
     );
 
     Ok(())
   }
 
   pub(crate) fn update_savepoints(index: &Index, height: u32) -> Result {
-    if let redb::Durability::None = index.durability {
-      return Ok(());
+    if Self::is_savepoint_required(index, height)? {
+      // 将checkpoint目录放在与index.rocksdb同级目录
+      let checkpoints_dir = index
+        .path
+        .parent()
+        .ok_or_else(|| anyhow!("Cannot get parent directory of index path"))?
+        .join("checkpoints");
+      fs::create_dir_all(&checkpoints_dir)?;
+
+      log::debug!("Creating checkpoint at height {}", height);
+
+      // 创建checkpoint
+      let checkpoint_path = checkpoints_dir.join(format!("checkpoint_{}", height));
+      let checkpoint = Checkpoint::new(&index.database)?;
+      checkpoint.create_checkpoint(&checkpoint_path)?;
+
+      log::debug!(
+        "Checkpoint created successfully at {}",
+        checkpoint_path.display()
+      );
+
+      // 更新最后savepoint高度
+      let statistic_to_count = index
+        .database
+        .cf_handle(CF_STATISTIC_TO_COUNT)
+        .ok_or_else(|| anyhow!("Failed to open column family 'statistic_to_count'"))?;
+
+      index.database.put_cf_opt(
+        statistic_to_count,
+        &Statistic::LastSavepointHeight.key().to_be_bytes(),
+        &height.to_be_bytes(),
+        &index.write_options,
+      )?;
+
+      let mut flush_opts = FlushOptions::default();
+      flush_opts.set_wait(true);
+
+      index
+        .database
+        .flush_cf_opt(statistic_to_count, &flush_opts)?;
+
+      // 清理旧的checkpoints
+      Self::cleanup_old_checkpoints(&checkpoints_dir)?;
     }
 
-    if (height < SAVEPOINT_INTERVAL || height % SAVEPOINT_INTERVAL == 0)
-      && u32::try_from(
-        index
-          .settings
-          .bitcoin_rpc_client(None)?
-          .get_blockchain_info()?
-          .headers,
-      )
-      .unwrap()
-      .saturating_sub(height)
-        <= CHAIN_TIP_DISTANCE
-    {
-      let wtx = index.begin_write()?;
+    Ok(())
+  }
 
-      let savepoints = wtx.list_persistent_savepoints()?.collect::<Vec<u64>>();
+  /// 清理旧的checkpoints，只保留最新的MAX_SAVEPOINTS个
+  fn cleanup_old_checkpoints(checkpoints_dir: &Path) -> Result<()> {
+    let mut checkpoint_dirs: Vec<_> = fs::read_dir(checkpoints_dir)?
+      .filter_map(|entry| {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        if path.is_dir() {
+          let name = path.file_name()?.to_str()?;
+          if name.starts_with("checkpoint_") {
+            let height_str = &name[11..]; // 跳过 "checkpoint_" 前缀
+            height_str.parse::<u32>().ok().map(|height| (height, path))
+          } else {
+            None
+          }
+        } else {
+          None
+        }
+      })
+      .collect();
 
-      if savepoints.len() >= usize::try_from(MAX_SAVEPOINTS).unwrap() {
-        wtx.delete_persistent_savepoint(savepoints.into_iter().min().unwrap())?;
+    checkpoint_dirs.sort_by_key(|(height, _)| *height);
+
+    // 删除多余的checkpoints
+    if checkpoint_dirs.len() > MAX_SAVEPOINTS as usize {
+      let to_remove = checkpoint_dirs.len() - MAX_SAVEPOINTS as usize;
+      for (_, path) in checkpoint_dirs.iter().take(to_remove) {
+        log::debug!("Removing old checkpoint: {}", path.display());
+        fs::remove_dir_all(path)?;
       }
-
-      Index::increment_statistic(&wtx, Statistic::Commits, 1)?;
-      wtx.commit()?;
-
-      let wtx = index.begin_write()?;
-
-      log::debug!("creating savepoint at height {}", height);
-      wtx.persistent_savepoint()?;
-
-      Index::increment_statistic(&wtx, Statistic::Commits, 1)?;
-      wtx.commit()?;
     }
 
     Ok(())

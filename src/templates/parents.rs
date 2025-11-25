@@ -3,7 +3,7 @@ use super::*;
 #[derive(Boilerplate)]
 pub(crate) struct ParentsHtml {
   pub(crate) id: InscriptionId,
-  pub(crate) number: i32,
+  pub(crate) number: i64,
   pub(crate) parents: Vec<InscriptionId>,
   pub(crate) prev_page: Option<usize>,
   pub(crate) next_page: Option<usize>,

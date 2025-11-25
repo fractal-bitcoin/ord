@@ -4,7 +4,6 @@ use {
     Index,
   },
   ordinals::varint,
-  redb::TypeName,
   ref_cast::RefCast,
   std::ops::Deref,
 };
@@ -31,7 +30,7 @@ enum Sats<'a> {
 /// Note that the list of inscriptions doesn't need an explicit length, it
 /// continues until the end of the array.
 ///
-/// A `UtxoEntry` is the read-only value stored in redb as a byte string. A
+/// A `UtxoEntry` is the read-only value stored in RocksDB as a byte string. A
 /// `UtxoEntryBuf` is the writeable version, used for constructing new
 /// `UtxoEntry`s. A `ParsedUtxoEntry` is the parsed value.
 #[derive(Debug, RefCast)]
@@ -86,37 +85,14 @@ impl UtxoEntry {
       vec: self.bytes.to_vec(),
       #[cfg(debug_assertions)]
       state: State::Valid,
+      value: 1000,
     }
   }
 }
 
-impl redb::Value for &UtxoEntry {
-  type SelfType<'a> = &'a UtxoEntry where Self: 'a;
-  type AsBytes<'a> = &'a [u8] where Self: 'a;
-
-  fn fixed_width() -> Option<usize> {
-    None
-  }
-
-  fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
-  where
-    Self: 'a,
-  {
-    UtxoEntry::ref_cast(data)
-  }
-
-  fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
-  where
-    Self: 'a,
-    Self: 'b,
-  {
-    &value.bytes
-  }
-
-  fn type_name() -> TypeName {
-    TypeName::new("&ord::index::utxo_entry::UtxoValue")
-  }
-}
+// RocksDB doesn't require the redb::Value trait implementation
+// This trait implementation has been removed for RocksDB compatibility
+// The UtxoEntry struct now works directly with byte arrays
 
 pub struct ParsedUtxoEntry<'a> {
   sats: Sats<'a>,
@@ -154,18 +130,18 @@ impl<'a> ParsedUtxoEntry<'a> {
     self.inscriptions.unwrap()
   }
 
-  pub fn parse_inscriptions(&self) -> Vec<(u32, u64)> {
+  pub fn parse_inscriptions(&self) -> Vec<(u64, u64)> {
     let inscriptions = self.inscriptions.unwrap();
     let mut byte_offset = 0;
     let mut parsed_inscriptions = Vec::new();
 
     while byte_offset < inscriptions.len() {
-      let sequence_number = u32::from_le_bytes(
-        inscriptions[byte_offset..byte_offset + 4]
+      let sequence_number = u64::from_le_bytes(
+        inscriptions[byte_offset..byte_offset + 8]
           .try_into()
           .unwrap(),
       );
-      byte_offset += 4;
+      byte_offset += 8;
 
       let (satpoint_offset, varint_len) = varint::decode(&inscriptions[byte_offset..]).unwrap();
       let satpoint_offset = u64::try_from(satpoint_offset).unwrap();
@@ -179,18 +155,19 @@ impl<'a> ParsedUtxoEntry<'a> {
 }
 
 #[cfg(debug_assertions)]
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 enum State {
   NeedSats,
   NeedScriptPubkey,
   Valid,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct UtxoEntryBuf {
   vec: Vec<u8>,
   #[cfg(debug_assertions)]
   state: State,
+  value: u64
 }
 
 impl UtxoEntryBuf {
@@ -199,12 +176,19 @@ impl UtxoEntryBuf {
       vec: Vec::new(),
       #[cfg(debug_assertions)]
       state: State::NeedSats,
+      value: 1000,
     }
+  }
+
+  pub fn dust(&self) -> bool {
+    self.value <= 546
   }
 
   pub fn push_value(&mut self, value: u64, index: &Index) {
     assert!(!index.index_sats);
     varint::encode_to_vec(value.into(), &mut self.vec);
+
+    self.value = value;
 
     #[cfg(debug_assertions)]
     self.advance_state(State::NeedSats, State::NeedScriptPubkey, index);
@@ -238,7 +222,7 @@ impl UtxoEntryBuf {
     self.advance_state(State::Valid, State::Valid, index);
   }
 
-  pub fn push_inscription(&mut self, sequence_number: u32, satpoint_offset: u64, index: &Index) {
+  pub fn push_inscription(&mut self, sequence_number: u64, satpoint_offset: u64, index: &Index) {
     assert!(index.index_inscriptions);
     self.vec.extend(sequence_number.to_le_bytes());
     varint::encode_to_vec(satpoint_offset.into(), &mut self.vec);
@@ -305,6 +289,10 @@ impl UtxoEntryBuf {
     #[cfg(debug_assertions)]
     assert!(self.state == State::Valid);
     UtxoEntry::ref_cast(&self.vec)
+  }
+
+  pub fn as_bytes(&self) -> &[u8] {
+    &self.vec
   }
 }
 

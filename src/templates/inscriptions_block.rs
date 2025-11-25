@@ -6,8 +6,8 @@ pub(crate) struct InscriptionsBlockHtml {
   pub(crate) inscriptions: Vec<InscriptionId>,
   pub(crate) prev_block: Option<u32>,
   pub(crate) next_block: Option<u32>,
-  pub(crate) prev_page: Option<u32>,
-  pub(crate) next_page: Option<u32>,
+  pub(crate) prev_page: Option<u64>,
+  pub(crate) next_page: Option<u64>,
 }
 
 impl InscriptionsBlockHtml {
@@ -16,7 +16,7 @@ impl InscriptionsBlockHtml {
     current_blockheight: u32,
     inscriptions: Vec<InscriptionId>,
     more_inscriptions: bool,
-    page_index: u32,
+    page_index: u64,
   ) -> Result<Self> {
     if inscriptions.is_empty() {
       return Err(anyhow!("page index {page_index} exceeds inscription count"));

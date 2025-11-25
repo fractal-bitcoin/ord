@@ -8,15 +8,13 @@ use {
     psbt::Psbt,
   },
   bitcoincore_rpc::bitcoincore_rpc_json::{Descriptor, ImportDescriptors, Timestamp},
-  entry::{EtchingEntry, EtchingEntryValue},
+  entry::EtchingEntry,
   fee_rate::FeeRate,
   index::entry::Entry,
   indicatif::{ProgressBar, ProgressStyle},
-  log::log_enabled,
   miniscript::descriptor::{DescriptorSecretKey, DescriptorXKey, Wildcard},
-  redb::{Database, DatabaseError, ReadableTable, RepairSession, StorageError, TableDefinition},
   reqwest::header,
-  std::sync::Once,
+  rocksdb::{IteratorMode, Options, WriteBatch, DB},
   transaction_builder::TransactionBuilder,
 };
 
@@ -27,8 +25,8 @@ pub mod wallet_constructor;
 
 const SCHEMA_VERSION: u64 = 1;
 
-define_table! { RUNE_TO_ETCHING, u128, EtchingEntryValue }
-define_table! { STATISTICS, u64, u64 }
+// RocksDB doesn't use table definitions like redb
+// Column families are handled differently
 
 #[derive(Copy, Clone)]
 pub(crate) enum Statistic {
@@ -58,7 +56,7 @@ pub(crate) enum Maturity {
 
 pub(crate) struct Wallet {
   bitcoin_client: Client,
-  database: Database,
+  database: DB,
   has_rune_index: bool,
   has_sat_index: bool,
   rpc_url: Url,
@@ -573,11 +571,11 @@ impl Wallet {
     )
   }
 
-  pub(crate) fn open_database(wallet_name: &String, settings: &Settings) -> Result<Database> {
+  pub(crate) fn open_database(wallet_name: &String, settings: &Settings) -> Result<DB> {
     let path = settings
       .data_dir()
       .join("wallets")
-      .join(format!("{wallet_name}.redb"));
+      .join(format!("{wallet_name}.rocksdb"));
 
     if let Err(err) = fs::create_dir_all(path.parent().unwrap()) {
       bail!(
@@ -586,84 +584,45 @@ impl Wallet {
       );
     }
 
-    let db_path = path.clone().to_owned();
-    let once = Once::new();
-    let progress_bar = Mutex::new(None);
-    let integration_test = settings.integration_test();
+    // For RocksDB, we'll use a simpler approach without repair callbacks
+    // RocksDB has built-in recovery mechanisms
 
-    let repair_callback = move |progress: &mut RepairSession| {
-      once.call_once(|| {
-        println!(
-          "Wallet database file `{}` needs recovery. This can take some time.",
-          db_path.display()
-        )
-      });
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
 
-      if !(cfg!(test) || log_enabled!(log::Level::Info) || integration_test) {
-        let mut guard = progress_bar.lock().unwrap();
+    let database =
+      DB::open(&opts, &path).map_err(|e| anyhow!("failed to open wallet database: {}", e))?;
 
-        let progress_bar = guard.get_or_insert_with(|| {
-          let progress_bar = ProgressBar::new(100);
-          progress_bar.set_style(
-            ProgressStyle::with_template("[repairing database] {wide_bar} {pos}/{len}").unwrap(),
-          );
-          progress_bar
-        });
+    // Check schema version
+    let schema_version = database
+      .get_pinned(&Statistic::Schema.key().to_be_bytes())?
+      .map(|bytes| u64::from_be_bytes(bytes.as_ref().try_into().unwrap()))
+      .unwrap_or(0);
 
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        progress_bar.set_position((progress.progress() * 100.0) as u64);
+    match schema_version.cmp(&SCHEMA_VERSION) {
+      cmp::Ordering::Less =>
+        bail!(
+          "wallet database at `{}` appears to have been built with an older, incompatible version of ord, consider deleting and rebuilding the index: index schema {schema_version}, ord schema {SCHEMA_VERSION}",
+          path.display()
+        ),
+      cmp::Ordering::Greater =>
+        bail!(
+          "wallet database at `{}` appears to have been built with a newer, incompatible version of ord, consider updating ord: index schema {schema_version}, ord schema {SCHEMA_VERSION}",
+          path.display()
+        ),
+      cmp::Ordering::Equal => {
       }
-    };
+    }
 
-    let database = match Database::builder()
-      .set_repair_callback(repair_callback)
-      .open(&path)
-    {
-      Ok(database) => {
-        {
-          let schema_version = database
-            .begin_read()?
-            .open_table(STATISTICS)?
-            .get(&Statistic::Schema.key())?
-            .map(|x| x.value())
-            .unwrap_or(0);
-
-          match schema_version.cmp(&SCHEMA_VERSION) {
-            cmp::Ordering::Less =>
-              bail!(
-                "wallet database at `{}` appears to have been built with an older, incompatible version of ord, consider deleting and rebuilding the index: index schema {schema_version}, ord schema {SCHEMA_VERSION}",
-                path.display()
-              ),
-            cmp::Ordering::Greater =>
-              bail!(
-                "wallet database at `{}` appears to have been built with a newer, incompatible version of ord, consider updating ord: index schema {schema_version}, ord schema {SCHEMA_VERSION}",
-                path.display()
-              ),
-            cmp::Ordering::Equal => {
-            }
-          }
-        }
-
-        database
-      }
-      Err(DatabaseError::Storage(StorageError::Io(error)))
-        if error.kind() == io::ErrorKind::NotFound =>
-      {
-        let database = Database::builder().create(&path)?;
-
-        let tx = database.begin_write()?;
-
-        tx.open_table(RUNE_TO_ETCHING)?;
-
-        tx.open_table(STATISTICS)?
-          .insert(&Statistic::Schema.key(), &SCHEMA_VERSION)?;
-
-        tx.commit()?;
-
-        database
-      }
-      Err(error) => bail!("failed to open wallet database: {error}"),
-    };
+    // Initialize database if it's new
+    if schema_version == 0 {
+      let mut batch = WriteBatch::default();
+      batch.put(
+        &Statistic::Schema.key().to_be_bytes(),
+        &SCHEMA_VERSION.to_be_bytes(),
+      );
+      database.write(batch)?;
+    }
 
     Ok(database)
   }
@@ -675,54 +634,54 @@ impl Wallet {
     reveal: &Transaction,
     output: batch::Output,
   ) -> Result {
-    let wtx = self.database.begin_write()?;
+    // For RocksDB, we'll use WriteBatch for atomic operations
+    let mut batch = WriteBatch::default();
 
-    wtx.open_table(RUNE_TO_ETCHING)?.insert(
-      rune.0,
-      EtchingEntry {
-        commit: commit.clone(),
-        reveal: reveal.clone(),
-        output,
-      }
-      .store(),
-    )?;
+    let etching_entry = EtchingEntry {
+      commit: commit.clone(),
+      reveal: reveal.clone(),
+      output,
+    };
+    batch.put(&rune.store(), &etching_entry.store());
 
-    wtx.commit()?;
+    self.database.write(batch)?;
 
     Ok(())
   }
 
   pub(crate) fn load_etching(&self, rune: Rune) -> Result<Option<EtchingEntry>> {
-    let rtx = self.database.begin_read()?;
-
+    // For RocksDB, we'll use direct database access
     Ok(
-      rtx
-        .open_table(RUNE_TO_ETCHING)?
-        .get(rune.0)?
-        .map(|result| EtchingEntry::load(result.value())),
+      self
+        .database
+        .get_pinned(&rune.store())?
+        .map(|bytes| EtchingEntry::load(bytes.to_vec())),
     )
   }
 
   pub(crate) fn clear_etching(&self, rune: Rune) -> Result {
-    let wtx = self.database.begin_write()?;
+    // For RocksDB, we'll use WriteBatch for atomic operations
+    let mut batch = WriteBatch::default();
 
-    wtx.open_table(RUNE_TO_ETCHING)?.remove(rune.0)?;
-    wtx.commit()?;
+    batch.delete(&rune.store());
+
+    self.database.write(batch)?;
 
     Ok(())
   }
 
   pub(crate) fn pending_etchings(&self) -> Result<Vec<(Rune, EtchingEntry)>> {
-    let rtx = self.database.begin_read()?;
+    // For RocksDB, we'll use iterator to get all etchings
+    let mut etchings = Vec::new();
+    let iter = self.database.iterator(IteratorMode::Start);
 
-    Ok(
-      rtx
-        .open_table(RUNE_TO_ETCHING)?
-        .iter()?
-        .map(|result| {
-          result.map(|(key, value)| (Rune(key.value()), EtchingEntry::load(value.value())))
-        })
-        .collect::<Result<Vec<(Rune, EtchingEntry)>, StorageError>>()?,
-    )
+    for result in iter {
+      let (key_bytes, value_bytes) = result?;
+      let rune = Rune::load(key_bytes.to_vec());
+      let etching = EtchingEntry::load(value_bytes.to_vec());
+      etchings.push((rune, etching));
+    }
+
+    Ok(etchings)
   }
 }

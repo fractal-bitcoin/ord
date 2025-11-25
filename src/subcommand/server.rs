@@ -1898,7 +1898,7 @@ impl Server {
   async fn inscriptions_paginated(
     Extension(server_config): Extension<Arc<ServerConfig>>,
     Extension(index): Extension<Arc<Index>>,
-    Path(page_index): Path<u32>,
+    Path(page_index): Path<u64>,
     AcceptJson(accept_json): AcceptJson,
   ) -> ServerResult {
     task::block_in_place(|| {
@@ -1945,7 +1945,7 @@ impl Server {
   async fn inscriptions_in_block_paginated(
     Extension(server_config): Extension<Arc<ServerConfig>>,
     Extension(index): Extension<Arc<Index>>,
-    Path((block_height, page_index)): Path<(u32, u32)>,
+    Path((block_height, page_index)): Path<(u32, u64)>,
     AcceptJson(accept_json): AcceptJson,
   ) -> ServerResult {
     task::block_in_place(|| {
@@ -2050,7 +2050,7 @@ impl Server {
       let (ids, more) = index.get_parents_by_sequence_number_paginated(child.parents, page)?;
 
       let page_index =
-        u32::try_from(page).map_err(|_| anyhow!("page index {} out of range", page))?;
+        u64::try_from(page).map_err(|_| anyhow!("page index {} out of range", page))?;
 
       Ok(
         Json(api::Inscriptions {

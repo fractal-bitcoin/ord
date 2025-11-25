@@ -20,7 +20,7 @@ impl FromStr for Block {
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum Inscription {
   Id(InscriptionId),
-  Number(i32),
+  Number(i64),
   Sat(Sat),
 }
 

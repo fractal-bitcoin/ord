@@ -1,46 +1,99 @@
 use super::*;
+use rocksdb::{ColumnFamily, IteratorMode};
 
-pub(crate) struct Rtx(pub(crate) redb::ReadTransaction);
+pub(crate) struct Rtx {
+  database: rocksdb::DB,
+}
 
 impl Rtx {
+  pub(crate) fn new(database: rocksdb::DB) -> Result<Rtx> {
+    Ok(Self { database })
+  }
+
   pub(crate) fn block_height(&self) -> Result<Option<Height>> {
-    Ok(
-      self
-        .0
-        .open_table(HEIGHT_TO_BLOCK_HEADER)?
-        .range(0..)?
-        .next_back()
-        .transpose()?
-        .map(|(height, _header)| Height(height.value())),
-    )
+    let height_to_block_header_cf = self
+      .database
+      .cf_handle(CF_HEIGHT_TO_BLOCK_HEADER)
+      .ok_or_else(|| anyhow!("Column family 'height_to_block_header' not found"))?;
+    let mut iter = self
+      .database
+      .iterator_cf(height_to_block_header_cf, IteratorMode::End);
+    if let Some(Ok((height_bytes, _))) = iter.next() {
+      let height = u32::from_be_bytes(height_bytes.as_ref().try_into().unwrap());
+      Ok(Some(Height(height)))
+    } else {
+      Ok(None)
+    }
   }
 
   pub(crate) fn block_count(&self) -> Result<u32> {
-    Ok(
-      self
-        .0
-        .open_table(HEIGHT_TO_BLOCK_HEADER)?
-        .range(0..)?
-        .next_back()
-        .transpose()?
-        .map(|(height, _header)| height.value() + 1)
-        .unwrap_or(0),
-    )
+    let height_to_block_header_cf = self
+      .database
+      .cf_handle(CF_HEIGHT_TO_BLOCK_HEADER)
+      .ok_or_else(|| anyhow!("Column family 'height_to_block_header' not found"))?;
+    let mut iter = self
+      .database
+      .iterator_cf(height_to_block_header_cf, IteratorMode::End);
+    if let Some(Ok((height_bytes, _))) = iter.next() {
+      let height = u32::from_be_bytes(height_bytes.as_ref().try_into().unwrap());
+      Ok(height + 1)
+    } else {
+      Ok(0)
+    }
   }
 
   pub(crate) fn block_hash(&self, height: Option<u32>) -> Result<Option<BlockHash>> {
-    let height_to_block_header = self.0.open_table(HEIGHT_TO_BLOCK_HEADER)?;
-
-    Ok(
-      match height {
-        Some(height) => height_to_block_header.get(height)?,
-        None => height_to_block_header
-          .range(0..)?
-          .next_back()
-          .transpose()?
-          .map(|(_height, header)| header),
+    let height_to_block_header_cf = self
+      .database
+      .cf_handle(CF_HEIGHT_TO_BLOCK_HEADER)
+      .ok_or_else(|| anyhow!("Column family 'height_to_block_header' not found"))?;
+    match height {
+      Some(height) => {
+        // Get block hash for specific height
+        let height_bytes = height.to_be_bytes();
+        if let Some(header_bytes) = self
+          .database
+          .get_cf(height_to_block_header_cf, &height_bytes)?
+        {
+          let header = Header::load(header_bytes.to_vec());
+          Ok(Some(header.block_hash()))
+        } else {
+          Ok(None)
+        }
       }
-      .map(|header| Header::load(*header.value()).block_hash()),
-    )
+      None => {
+        // Get block hash for the latest height
+        let mut iter = self
+          .database
+          .iterator_cf(height_to_block_header_cf, IteratorMode::End);
+        if let Some(Ok((_height_bytes, header_bytes))) = iter.next() {
+          let header = Header::load(header_bytes.to_vec());
+          Ok(Some(header.block_hash()))
+        } else {
+          Ok(None)
+        }
+      }
+    }
+  }
+
+  /// Get a column family handle by name
+  pub(crate) fn get_cf(&self, name: &str) -> Result<&ColumnFamily> {
+    self
+      .database
+      .cf_handle(name)
+      .ok_or_else(|| anyhow!("Column family '{}' not found", name))
+  }
+
+  /// Get a value from a specific column family
+  pub(crate) fn get_cf_value<K>(&self, cf: &ColumnFamily, key: &K) -> Result<Option<Vec<u8>>>
+  where
+    K: AsRef<[u8]>,
+  {
+    Ok(self.database.get_cf(cf, key.as_ref())?)
+  }
+
+  /// Iterate over a column family
+  pub(crate) fn iter_cf(&self, cf: &ColumnFamily, mode: IteratorMode) -> rocksdb::DBIterator {
+    self.database.iterator_cf(cf, mode)
   }
 }

@@ -1,0 +1,68 @@
+on: [push, pull_request]
+
+name: Continuous integration
+
+jobs:
+  Tests:
+    name: Tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macOS-latest
+          - windows-latest
+        toolchain:
+          - stable
+          - 1.41.1
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Crate
+        uses: actions/checkout@v2
+      - name: Checkout Toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ matrix.toolchain }}
+          override: true
+      - name: Running tests on ${{ matrix.toolchain }}
+        env:
+          DO_FEATURE_MATRIX: true
+        run: ./contrib/test.sh
+
+  Nightly:
+    name: Nightly - Docs + Fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Crate
+        uses: actions/checkout@v2
+      - name: Checkout Toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: nightly
+          override: true
+      - name: Building docs
+        env:
+          DO_DOCS: true
+        run: ./contrib/test.sh
+      - name: Run the formatter
+        env:
+          DO_FMT: true
+        run: ./contrib/test.sh
+
+  Clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - run: rustup component add clippy
+      - uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: --all-features -- -D warnings

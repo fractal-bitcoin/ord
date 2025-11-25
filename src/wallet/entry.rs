@@ -7,32 +7,19 @@ pub struct EtchingEntry {
   pub output: batch::Output,
 }
 
-pub(super) type EtchingEntryValue = (
-  Vec<u8>, // commit
-  Vec<u8>, // reveal
-  Vec<u8>, // output
-);
+pub(super) type EtchingEntryValue = Vec<u8>;
 
 impl Entry for EtchingEntry {
   type Value = EtchingEntryValue;
 
-  fn load((commit, reveal, output): EtchingEntryValue) -> Self {
-    Self {
-      commit: consensus::encode::deserialize::<Transaction>(&commit).unwrap(),
-      reveal: consensus::encode::deserialize::<Transaction>(&reveal).unwrap(),
-      output: serde_json::from_slice(&output).unwrap(),
-    }
+  fn load(data: Self::Value) -> Self {
+    ciborium::from_reader(&data[..]).unwrap()
   }
 
   fn store(self) -> Self::Value {
-    (
-      consensus::encode::serialize(&self.commit),
-      consensus::encode::serialize(&self.reveal),
-      serde_json::to_string(&self.output)
-        .unwrap()
-        .as_bytes()
-        .to_owned(),
-    )
+    let mut writer = Vec::new();
+    ciborium::into_writer(&self, &mut writer).unwrap();
+    writer
   }
 }
 
@@ -84,22 +71,15 @@ mod tests {
       total_fees: 0,
     };
 
-    let value = (
-      consensus::encode::serialize(&commit),
-      consensus::encode::serialize(&reveal),
-      serde_json::to_string(&output)
-        .unwrap()
-        .as_bytes()
-        .to_owned(),
-    );
-
     let entry = EtchingEntry {
       commit,
       reveal,
       output,
     };
 
-    assert_eq!(entry.clone().store(), value);
-    assert_eq!(EtchingEntry::load(value), entry);
+    // Test serialization round-trip
+    let serialized = entry.clone().store();
+    let deserialized = EtchingEntry::load(serialized);
+    assert_eq!(entry, deserialized);
   }
 }

@@ -148,8 +148,14 @@ mod tests {
     assert_eq!("regtest".parse::<Chain>().unwrap(), Chain::Regtest);
     assert_eq!("signet".parse::<Chain>().unwrap(), Chain::Signet);
     assert_eq!("testnet".parse::<Chain>().unwrap(), Chain::Testnet);
-    assert_eq!("fractal-mainnet".parse::<Chain>().unwrap(), Chain::FractalMainnet);
-    assert_eq!("fractal-testnet".parse::<Chain>().unwrap(), Chain::FractalTestnet);
+    assert_eq!(
+      "fractal-mainnet".parse::<Chain>().unwrap(),
+      Chain::FractalMainnet
+    );
+    assert_eq!(
+      "fractal-testnet".parse::<Chain>().unwrap(),
+      Chain::FractalTestnet
+    );
     assert_eq!(
       "foo".parse::<Chain>().unwrap_err().to_string(),
       "Invalid chain `foo`"
