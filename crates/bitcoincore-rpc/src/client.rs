@@ -346,7 +346,7 @@ pub trait RpcApi: Sized {
 
     let decoded_len = hex_str.len() / 2;
     let mut buffer = vec![0u8; decoded_len];
-    hex::decode_to_slice(hex_str, &mut buffer);
+    let _ = hex::decode_to_slice(hex_str, &mut buffer);
 
     let block = bitcoin::consensus::encode::deserialize(&buffer).unwrap();
     Ok(block)

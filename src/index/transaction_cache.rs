@@ -774,6 +774,7 @@ impl TransactionCache {
     ))
   }
 
+  #[allow(dead_code)]
   pub fn get_home_inscription_count(&self, database: &DB) -> Result<u64> {
     let home_inscriptions_cf = database.cf_handle(CF_HOME_INSCRIPTIONS).unwrap();
     let mut count = 0;

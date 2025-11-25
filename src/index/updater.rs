@@ -265,6 +265,7 @@ where
     Ok(rx)
   }
 
+  #[allow(dead_code)]
   fn fetch_blocks_from_x(
     index: &Index,
     mut height: u32,

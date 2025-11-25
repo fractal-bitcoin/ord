@@ -109,7 +109,7 @@ impl Fetcher {
             let decoded_len = hex_str.len() / 2;
             let mut buffer = vec![0u8; decoded_len];
             hex::decode_to_slice(hex_str, &mut buffer)
-              .map_err(|e| anyhow!("Result for batched JSON-RPC response not valid hex: {e}"));
+              .map_err(|e| anyhow!("Result for batched JSON-RPC response not valid hex: {e}"))?;
             Ok(buffer)
           })
           .and_then(|buffer| {

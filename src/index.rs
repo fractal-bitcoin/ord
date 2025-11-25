@@ -269,8 +269,6 @@ impl Index {
     opts.set_max_total_wal_size(1024 * 1024 * 1024);
     opts.set_max_open_files(256);
     opts.set_max_background_jobs(6);
-    opts.set_max_background_compactions(4);
-    opts.set_max_background_flushes(2);
     opts.set_bytes_per_sync(4 * 1024 * 1024); // 1MB
     opts.set_wal_bytes_per_sync(4 * 1024 * 1024); // 1MB
 
@@ -451,7 +449,6 @@ impl Index {
         database.write_opt(batch, &write_options)?;
         database
       }
-      Err(_) => bail!("failed to open index: database creation failed"),
     };
 
     let index_addresses;
@@ -1878,9 +1875,9 @@ impl Index {
       let utxo_entry = UtxoEntry::ref_cast(&entry_bytes).to_buf();
       let parsed = utxo_entry.parse(self);
 
-      if let inscriptions_bytes = parsed.inscriptions() {
-        let mut result = Vec::new();
-        let mut byte_offset = 0;
+      let inscriptions_bytes = parsed.inscriptions();
+      let mut result = Vec::new();
+      let mut byte_offset = 0;
 
         while byte_offset < inscriptions_bytes.len() {
           let sequence_number = u64::from_le_bytes(
@@ -1925,9 +1922,6 @@ impl Index {
         }
 
         Ok(result)
-      } else {
-        Ok(Vec::new())
-      }
     } else {
       Ok(Vec::new())
     }
