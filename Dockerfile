@@ -13,7 +13,8 @@ RUN apt-get update && apt-get install -y \
 
 COPY . .
 
-RUN cargo build --bin ord --release
+#RUN cargo build --bin ord --release
+RUN RUSTFLAGS="--deny warnings" cargo build --bin ord --release
 
 FROM debian:bookworm-slim
 
