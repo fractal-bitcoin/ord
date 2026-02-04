@@ -1882,53 +1882,27 @@ impl Index {
       let utxo_entry = UtxoEntry::ref_cast(&entry_bytes).to_buf();
       let parsed = utxo_entry.parse(self);
 
-      let inscriptions_bytes = parsed.inscriptions();
+      let mut inscriptions = parsed.parse_inscriptions();
+      inscriptions.sort_by_key(|(sequence_number, _)| *sequence_number);
       let mut result = Vec::new();
-      let mut byte_offset = 0;
-
-        while byte_offset < inscriptions_bytes.len() {
-          let sequence_number = u64::from_le_bytes(
-            inscriptions_bytes[byte_offset..byte_offset + 8]
-              .try_into()
-              .unwrap(),
-          );
-          byte_offset += 8;
-
-          let (satpoint_offset, varint_len) =
-            varint::decode(&inscriptions_bytes[byte_offset..]).unwrap();
-          let satpoint_offset = u64::try_from(satpoint_offset).unwrap();
-          byte_offset += varint_len;
-
-          let sequence_number_to_inscription_entry_cf = self
-            .database
-            .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
-            .unwrap();
-          if let Some(entry_bytes) = self.database.get_cf(
-            sequence_number_to_inscription_entry_cf,
-            &sequence_number.to_be_bytes(),
-          )? {
-            let inscription_entry = InscriptionEntry::load(entry_bytes);
-            let inscription_id = inscription_entry.id;
-
-            // Calculate the actual SatPoint
-            let mut offset = 0;
-            let sat_ranges = parsed.sat_ranges();
-            for chunk in sat_ranges.chunks_exact(14) {
-              let (start, end) = SatRange::load(chunk.try_into().unwrap());
-              if satpoint_offset < offset + (end - start) {
-                let sat_point = SatPoint {
-                  outpoint,
-                  offset: satpoint_offset - offset,
-                };
-                result.push((sat_point, inscription_id));
-                break;
-              }
-              offset += end - start;
-            }
-          }
+      for (sequence_number, satpoint_offset) in inscriptions {
+        let sequence_number_to_inscription_entry_cf = self
+          .database
+          .cf_handle(CF_SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY)
+          .unwrap();
+        if let Some(entry_bytes) = self.database.get_cf(
+          sequence_number_to_inscription_entry_cf,
+          &sequence_number.to_le_bytes(),
+        )? {
+          let inscription_entry = InscriptionEntry::load(entry_bytes);
+          result.push((SatPoint {
+            outpoint,
+            offset: satpoint_offset,
+          }, inscription_entry.id));
         }
-
-        Ok(result)
+      }
+      
+      Ok(result)
     } else {
       Ok(Vec::new())
     }
